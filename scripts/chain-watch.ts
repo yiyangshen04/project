@@ -1516,6 +1516,21 @@ async function main(): Promise<void> {
     "no-side",
     "outcome-exact",
   ]);
+  // 07-21 Burnham 复盘:前置 skip 分支在 executeSignal 之前 return,既不写
+  // ledger 也不打 chain-watch-trade 行,汇总 trade_attempts 计数便找不到任何
+  // 对应明细,事后只能靠 notified 指纹反推。skip 也打同构 JSON 行;ledger
+  // 语义保持"executeSignal 必写"不变。
+  const logTradeSkip = (n: Notable, tokenId?: string): void => {
+    console.log(
+      JSON.stringify({
+        mode: "chain-watch-trade",
+        qid: n.qid.slice(0, 12),
+        token: tokenId ? tokenId.slice(0, 12) : undefined,
+        status: n.trade?.status,
+        reason: n.trade?.reason,
+      })
+    );
+  };
   // anchorAskOverride(§13,仅 P1 快路径传):跨轮传递的首轮盘口锚,取代
   // 本轮 exec.bestAsk 作为执行漂移带的基准。undefined = 用本轮注解。
   const maybeExecuteTrade = async (
@@ -1541,10 +1556,12 @@ async function main(): Promise<void> {
           : "无盘口注解(注解预算耗尽或超出 EXEC_ANNOTATE_MAX),自动执行未评估 — 人工确认",
         subjectAlert: "🟢未评估",
       };
+      logTradeSkip(n, e?.tokenId);
       return;
     }
     if (e.closed) {
       n.trade = { mode: executionMode(), status: "skipped", reason: "市场已关闭,无可执行盘口" };
+      logTradeSkip(n, e.tokenId);
       return;
     }
     if (!AUTO_EXEC_DIR_METHODS.has(e.dirMethod)) {
@@ -1553,6 +1570,7 @@ async function main(): Promise<void> {
         status: "skipped",
         reason: `方向映射 ${e.dirMethod} 是 bucket 启发式,不自动执行 — 请人工确认后手动下单`,
       };
+      logTradeSkip(n, e.tokenId);
       return;
     }
     try {
