@@ -111,6 +111,10 @@ export interface TradeSignalInput {
   llmEventStatus?: string | null;
   /** 信号注解时刻的 bestAsk(漂移防护的基准;null = 注解时无盘口)。 */
   bestAskAtSignal: number | null;
+  /** 注解时 book 实测空盘(execCheck.bookEmpty)。bestAskAtSignal=null 时用于
+   * 区分"空盘 taker 不可成交"(2026-08-01 复盘:CLOB book 全镜像,空 asks =
+   * 任何价位无对手盘,人工也无从下单)与"注解异常须人工核对"两种 skip 口径。 */
+  bookEmpty?: boolean;
   /** execCheck 的方向映射方法,进 ledger 供事后归因(P0-2⑤)。自动执行的
    * bucket-* 白名单拦截在 chain-watch 的 maybeExecuteTrade。 */
   dirMethod?: string;
@@ -813,10 +817,21 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
       // 下行暴跌守卫、tiering 的 M2 逆共识红旗全部失效(它们都以 bestAskAtSignal
       // 为锚)。这类信号只发信人工确认,不自动执行。
       if (input.bestAskAtSignal == null) {
+        // 空盘与注解异常分口径(2026-08-01 飓风家族复盘):空盘 = CLOB book
+        // (全镜像,含对侧腿)无任何卖侧挂单,taker 任何价位均不可成交,人工
+        // 手动下单同样无从成交 —— 不再误导性地喊人工;注解异常才需要人工核对。
+        if (input.bookEmpty) {
+          return finish({
+            mode,
+            status: "skipped",
+            reason: "盘口无卖侧挂单(空盘,CLOB book 含镜像对侧)—— taker 任何价位不可成交,人工亦无从下单;吃此腿唯 maker 挂单(策略层,未开)",
+            subjectAlert: "空盘不可成交",
+          });
+        }
         return finish({
           mode,
           status: "skipped",
-          reason: "信号注解无盘口基准(bestAskAtSignal=null),漂移带/暴跌守卫/M2 红旗不可用 — 人工确认后手动下单",
+          reason: "信号注解无盘口基准(bestAskAtSignal=null:book 未拉取/响应异常/首轮锚缺失),漂移带/暴跌守卫/M2 红旗不可用 — 人工确认后手动下单",
           subjectAlert: "无盘口基准",
         });
       }

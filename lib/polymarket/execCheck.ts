@@ -62,6 +62,11 @@ export interface ExecCheck {
   dirMethod: "yes-side" | "no-side" | "outcome-exact" | "bucket-contains" | "bucket-anti";
   bestAsk: number | null;
   bestBid: number | null;
+  /** book 拉取成功且卖侧为空 —— 与 bestAsk=null 的其余形态(未拉 book/响应
+   * 畸形)区分留痕。实测(2026-08-01,飓风家族复盘)CLOB /book 为全镜像:
+   * NO ask ≡ 1−YES bid 且 size 一致,故空 asks = 该方向任何价位均无 taker
+   * 对手盘,人工手动下单同样无从成交,唯 maker 挂单可吃(策略层,未开)。 */
+  bookEmpty: boolean;
   /** Ask-side notional (USD) within NEAR_ASK_BAND of best ask. */
   askUsdNear: number;
   /** askUsdNear ≥ MIN_EXEC_USD — the backtest's "真可执行" bar. */
@@ -302,6 +307,7 @@ export async function checkExecutability(input: {
 
     let bestAsk: number | null = null;
     let bestBid: number | null = null;
+    let bookEmpty = false;
     let askUsdNear = 0;
     let fill100: ExecCheck["fill100"] = null;
 
@@ -316,6 +322,12 @@ export async function checkExecutability(input: {
         .filter((p) => Number.isFinite(p))
         .sort((a, b) => b - a);
       bestBid = bids[0] ?? null;
+      // 空盘判定:响应结构完好(带 asks 数组或 market 标识)才算真空盘;
+      // 200 但畸形的瞬态坏响应(两者皆缺)不冒充空盘,维持 bookEmpty=false,
+      // 下游按"注解异常"口径处理。
+      if (asks.length === 0 && (Array.isArray(book.asks) || book.market != null)) {
+        bookEmpty = true;
+      }
       if (asks.length > 0) {
         bestAsk = asks[0].price;
         const ceiling = Math.min(bestAsk + NEAR_ASK_BAND, 0.999);
@@ -361,6 +373,7 @@ export async function checkExecutability(input: {
       dirMethod: dir.method,
       bestAsk,
       bestBid,
+      bookEmpty,
       askUsdNear: Math.round(askUsdNear * 100) / 100,
       executable: askUsdNear >= MIN_EXEC_USD,
       fill100,

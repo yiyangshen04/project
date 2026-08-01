@@ -1560,6 +1560,11 @@ async function main(): Promise<void> {
       return;
     }
     if (e.closed) {
+      // 策略假设标定(2026-08-01 复盘):07-20→08-01 实测 9 次 exec 尝试中
+      // 6 次落在此分支(07-26 批 5 个 + 07-28 1 个)——"结算后补发澄清"是
+      // 官方主流行为(Burnham 07-21 同款),不是个案。事件驱动路径的可交易
+      // 密度显著低于 bt3 回测口径(回测信号相当比例在实盘时点已无盘口),
+      // 年化预期与 8 月 go/no-go 评估按此折减,勿以回测信号数直推实盘笔数。
       n.trade = { mode: executionMode(), status: "skipped", reason: "市场已关闭,无可执行盘口" };
       logTradeSkip(n, e.tokenId);
       return;
@@ -1587,6 +1592,9 @@ async function main(): Promise<void> {
         llmConfidence: n.llm?.confidence ?? null,
         llmEventStatus: n.llm?.eventStatus ?? null,
         bestAskAtSignal: anchorAskOverride !== undefined ? anchorAskOverride : e.bestAsk,
+        // 空盘留痕恒取本轮注解:锚为 null 时,本轮 book 空 = taker 现在就
+        // 买不进(空盘口径);本轮有挂单 = 仅缺漂移基准(人工确认口径)。
+        bookEmpty: e.bookEmpty,
         dirMethod: e.dirMethod,
         negRisk: e.negRisk,
         // taker 费注解透传(2026-07-19 审查 §2:execCheck 取到了却在此丢弃,

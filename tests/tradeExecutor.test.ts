@@ -206,7 +206,7 @@ const FORECAST_SIGNAL = {
 
 async function execWith(
   env: Record<string, string>,
-  input: Partial<typeof FORECAST_SIGNAL>
+  input: Partial<Parameters<typeof executeSignal>[0]>
 ) {
   const dir = mkdtempSync(join(tmpdir(), "prededge-gate-"));
   const saved: Record<string, string | undefined> = {};
@@ -290,4 +290,27 @@ test("预告家族 dry 模式:闸门语义一致,paper skip 只拦 live 不拦 d
   // dry 过三闸门后继续全链路(client init 因缺钱包 error)——线上演练路径可用
   assert.equal(r.status, "error");
   assert.doesNotMatch(r.reason ?? "", /paper 验证期/);
+});
+
+// ── bestAskAtSignal=null 双口径(2026-08-01 飓风家族复盘)──
+// 空盘(bookEmpty)= CLOB book 全镜像下任何价位无 taker 对手盘,人工也无从
+// 下单,skip 文案不再误导性喊人工;仅注解异常口径才请求人工核对。
+
+test("无基准 skip:bookEmpty=true → 空盘口径(不喊人工下单)", async () => {
+  const r = await execWith({}, { bestAskAtSignal: null, bookEmpty: true, forecastTemplate: false });
+  assert.equal(r.status, "skipped");
+  assert.match(r.reason ?? "", /空盘/);
+  assert.match(r.reason ?? "", /maker/);
+  assert.doesNotMatch(r.reason ?? "", /人工确认后手动下单/);
+  assert.equal(r.subjectAlert, "空盘不可成交");
+});
+
+test("无基准 skip:bookEmpty 缺省/false → 注解异常口径(请求人工核对)", async () => {
+  const r = await execWith({}, { bestAskAtSignal: null, forecastTemplate: false });
+  assert.equal(r.status, "skipped");
+  assert.match(r.reason ?? "", /无盘口基准/);
+  assert.match(r.reason ?? "", /人工确认后手动下单/);
+  assert.equal(r.subjectAlert, "无盘口基准");
+  const explicit = await execWith({}, { bestAskAtSignal: null, bookEmpty: false, forecastTemplate: false });
+  assert.match(explicit.reason ?? "", /无盘口基准/);
 });
