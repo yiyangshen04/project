@@ -115,6 +115,11 @@ export interface TradeSignalInput {
    * 区分"空盘 taker 不可成交"(2026-08-01 复盘:CLOB book 全镜像,空 asks =
    * 任何价位无对手盘,人工也无从下单)与"注解异常须人工核对"两种 skip 口径。 */
   bookEmpty?: boolean;
+  /** 宣告类裁定(官方文本 "will/should resolve to X",历史兑现 98.8%)。
+   * 启用宣告扫单:限价帽按边缩放放宽,吃干净这一次而不是留货给跟随者。 */
+  declarative?: boolean;
+  /** Gamma 事件 ID —— 同事件聚合敞口帽的键(兄弟腿共享)。 */
+  eventId?: string | null;
   /** execCheck 的方向映射方法,进 ledger 供事后归因(P0-2⑤)。自动执行的
    * bucket-* 白名单拦截在 chain-watch 的 maybeExecuteTrade。 */
   dirMethod?: string;
@@ -143,6 +148,8 @@ interface LedgerEntry extends Omit<TradeAttempt, "status"> {
   /** 同一次执行尝试的 intent 行与终态行共享此 id,readLedger 只保留最后一行。 */
   attemptId?: string;
   conditionId?: string;
+  /** 同事件聚合敞口帽的键(2026-08-02);旧行无此字段 = 不参与该口径。 */
+  eventId?: string | null;
   outcome?: string;
   question?: string;
   label?: string;
@@ -185,6 +192,15 @@ export function execConfig() {
     maxOrderUsd: num("EXEC_MAX_ORDER_USD", 50),
     dailyMaxUsd: num("EXEC_DAILY_MAX_USD", 150),
     totalMaxUsd: num("EXEC_TOTAL_MAX_USD", 400),
+    /** 单 token 累计敞口上限(补仓窗口,2026-08-02 复盘)。原实现是二值封锁:
+     * 该 token 只要有敞口就永久 skip —— 07-28 成交后 4.5 分钟内约 85 股
+     * ≤0.69(全在我方限价内)的新挂单被他人吃走,全部结算 $1。默认等于单笔
+     * 上限,即最多补到与一次满仓同量,不放大总敞口。 */
+    perTokenMaxUsd: num("EXEC_PER_TOKEN_MAX_USD", num("EXEC_MAX_ORDER_USD", 50)),
+    /** 同事件(conditionId 之外的事件级家族)聚合敞口上限。飓风家族一条澄清
+     * 同时触发三个独立市场,现有闸门只按单笔/单日约束,同一个判断可以压到
+     * 3×maxOrder;判错时连亏熔断的"3 笔缓冲"在家族相关性下退化为 1 次判断。 */
+    perEventMaxUsd: num("EXEC_PER_EVENT_MAX_USD", 2 * num("EXEC_MAX_ORDER_USD", 50)),
     minOrderUsd: num("EXEC_MIN_ORDER_USD", 5),
     maxPrice: num("EXEC_MAX_PRICE", 0.97),
     minPrice: num("EXEC_MIN_PRICE", 0.15),
@@ -261,6 +277,24 @@ export const isTransportAmbiguous = (
  * 缩放,高价位退化回绝对带(只放宽低价位,绝不收紧既有行为)。 */
 export const upDriftBand = (signalAsk: number, slippage: number, edgeFrac: number): number =>
   Math.max(slippage, edgeFrac * (1 - signalAsk));
+
+/** 限价帽(2026-08-02 宣告扫单)。
+ *
+ * 普通 🟢:维持绝对滑点带(freshAsk + slippage)。bt3 均值 +21.3%/笔,这条边
+ * 很薄,把帽子放宽是确定的 EV 侵蚀换不确定的成交量,n=1 证据不足以支撑。
+ *
+ * 宣告类(官方文本直接写明结算结果,历史兑现 98.8%):按边缩放放宽,与漂移带
+ * 同一口径。这个子类里"少买"的成本远高于"多付两个价位" —— 对一张几乎确定
+ * 赔付 $1 的票,0.664 买是 +50.6%、0.711 买是 +40.8%,两倍的量显然胜过略高的
+ * 单位赢面。2026-07-28 实测:成交后 4.5 分钟内 ≤0.69 的 85 股被他人吃走。 */
+export const limitPriceFor = (
+  freshAsk: number,
+  declarative: boolean,
+  cfg: Pick<ReturnType<typeof execConfig>, "slippage" | "slippageEdgeFrac" | "maxPrice">
+): number => {
+  const band = declarative ? upDriftBand(freshAsk, cfg.slippage, cfg.slippageEdgeFrac) : cfg.slippage;
+  return Math.min(Math.round((freshAsk + band) * 100) / 100, cfg.maxPrice, 0.99);
+};
 
 /** 下行暴跌阈值(§2.3 对称侧):freshAsk 跌破信号价这么多 = 市场把裁定读成了
  * 反方向,此刻的"便宜"是毒饵 —— skip 待人工复核,不能当折扣照买。 */
@@ -727,6 +761,7 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
         qid: input.qid,
         tokenId: input.tokenId,
         conditionId: input.conditionId,
+        ...(input.eventId ? { eventId: input.eventId } : {}),
         outcome: input.outcome,
         question: input.question?.slice(0, 160),
         label: input.label,
@@ -812,6 +847,11 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
     const ledger = readLedger(cfg.ledger);
     let dailyLeft = cfg.maxOrderUsd;
     let totalLeft = cfg.maxOrderUsd;
+    /** 补仓口径:本 token 还能加多少(perTokenMaxUsd − 已有敞口)。 */
+    let tokenLeft = cfg.maxOrderUsd;
+    /** 同事件聚合口径:本事件还能加多少;eventId 未知时不设限。 */
+    let eventLeft = Number.POSITIVE_INFINITY;
+    let eventSpent = 0;
     if (!input.probe) {
       // 漂移防护前置条件(审计 2026-07-11 §5):注解时无盘口基准 = 上行漂移带、
       // 下行暴跌守卫、tiering 的 M2 逆共识红旗全部失效(它们都以 bestAskAtSignal
@@ -855,12 +895,26 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
       }
       // 去重只看「有敞口」的条目(P0-1):确认零成交(none)与明确拒单不封锁
       // token,否则一次 FAK 无对手盘就永久放弃该市场的后续机会。
-      const dup = ledger.find(
-        (e) =>
-          e.tokenId === input.tokenId &&
-          !e.probe &&
-          (exposedUsd(e) > 0 || (mode === "dry" && e.mode === "dry" && e.status === "dry"))
-      );
+      //
+      // 2026-08-02 复盘:原实现是「有敞口即永久 skip」的二值封锁,副作用是买过
+      // 一次就对该市场永久失明 —— 07-28 成交($47)后 4.5 分钟内又挂出约 85 股
+      // ≤0.69 的货(全部落在我方当时的限价内),被他人吃走且全部结算 $1。
+      // 改为 per-token 累计敞口上限:未达上限时放行并按剩余额度缩单。
+      const tokenExposure = ledger
+        .filter((e) => e.tokenId === input.tokenId && !e.probe)
+        .reduce((s, e) => s + exposedUsd(e), 0);
+      // dry 模式维持二值封锁(干跑不需要补仓语义,否则每 tick 重复构单)。
+      const dryDup =
+        mode === "dry"
+          ? ledger.find(
+              (e) => e.tokenId === input.tokenId && !e.probe && e.mode === "dry" && e.status === "dry"
+            )
+          : undefined;
+      const dup =
+        dryDup ??
+        (mode === "live" && tokenExposure >= cfg.perTokenMaxUsd
+          ? ledger.find((e) => e.tokenId === input.tokenId && !e.probe && exposedUsd(e) > 0)
+          : undefined);
       if (dup) {
         // P1 快轮询邮件失败重试会整段重放到这里(审计 2026-07-11 §8):重试轮
         // 送达的邮件是这条 skipped —— 不带持仓信息的话,真实成交会被呈现成
@@ -874,7 +928,10 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
         return finish({
           mode,
           status: "skipped",
-          reason: `已对该 token 执行过(${dup.at} ${dup.status}${held})`,
+          reason:
+            mode === "live"
+              ? `该 token 累计敞口已满($${tokenExposure.toFixed(0)}/${cfg.perTokenMaxUsd};${dup.at} ${dup.status}${held})`
+              : `已对该 token 执行过(${dup.at} ${dup.status}${held})`,
           ...(dup.status === "filled" || dup.status === "partial"
             ? { subjectAlert: `已持仓$${Math.round(dup.filledUsd ?? 0)}` }
             : dup.posted === "unknown"
@@ -907,10 +964,17 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
           subjectAlert: "日额度满",
         });
       }
-      // totalMax = 当前未结算持仓(P0-1③)。毛敞口未触顶时走快路径(零网络
-      // 调用);触顶才做 Gamma 结算核销,把已结算持仓从口径中释放。
+      // totalMax = 当前未结算持仓(P0-1③)。毛敞口是"历史累计成交",从不扣除
+      // 已结算的部分,所以它只是净敞口的上界。
+      //
+      // 2026-08-02 复盘缺陷:原实现只在毛额 ≥ totalMaxUsd 时才做结算核销,
+      // 未触顶时 totalLeft 直接用毛额算 —— 历史累计成交 $795(哪怕全部早已
+      // 结算回款)时 totalLeft 只剩 $5,订单被静默缩到 minOrderUsd 以下而净
+      // 敞口其实是 $0,且只有毛额恰好跨过上限那一刻才会自愈。
+      // 改为过半即核销:openExposureUsd 先读 trade-settled.json 本地缓存,
+      // 已结算条目零网络调用,代价极低。
       let openTotal = ledger.reduce((s, e) => s + exposedUsd(e), 0);
-      if (mode === "live" && openTotal >= cfg.totalMaxUsd) {
+      if (mode === "live" && openTotal >= cfg.totalMaxUsd * 0.5) {
         openTotal = await openExposureUsd(
           ledger,
           cfg,
@@ -925,6 +989,25 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
           });
         }
       }
+      // 同事件聚合帽(2026-08-02):一条澄清同时触发兄弟腿时,单笔/单日闸门
+      // 约束不住"同一个判断压了 N×maxOrder"。判错一次三腿一起亏,连亏熔断的
+      // 3 笔缓冲在家族相关性下退化为 1 次判断的缓冲。eventId 未知时本闸不生效
+      // (仍受单笔/单日/总额约束)。
+      if (mode === "live" && input.eventId) {
+        eventSpent = ledger
+          .filter((e) => e.eventId === input.eventId && !e.probe)
+          .reduce((s, e) => s + exposedUsd(e), 0);
+        if (eventSpent >= cfg.perEventMaxUsd) {
+          return finish({
+            mode,
+            status: "skipped",
+            reason: `同事件聚合敞口已满($${eventSpent.toFixed(0)}/${cfg.perEventMaxUsd},event ${input.eventId})`,
+            subjectAlert: "同事件敞口满",
+          });
+        }
+        eventLeft = Math.max(0, cfg.perEventMaxUsd - eventSpent);
+      }
+      tokenLeft = Math.max(0, cfg.perTokenMaxUsd - tokenExposure);
       dailyLeft = Math.max(0, cfg.dailyMaxUsd - spentToday);
       totalLeft = Math.max(0, cfg.totalMaxUsd - openTotal);
     }
@@ -984,20 +1067,22 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
       }
     }
 
-    const limitPrice = Math.min(
-      Math.round((freshAsk + cfg.slippage) * 100) / 100,
-      cfg.maxPrice,
-      0.99
-    );
+    const limitPrice = limitPriceFor(freshAsk, input.declarative === true, cfg);
     const depthUsd = asks
       .filter((l) => l.price <= limitPrice)
       .reduce((s, l) => s + l.price * l.size, 0);
-    let orderUsd = Math.floor(Math.min(cfg.maxOrderUsd, dailyLeft, totalLeft, depthUsd * 0.9));
+    // 深度不再打九折(2026-08-02):我们走的是 marketable-limit FAK ——「能吃
+    // 多少吃多少,吃不着即撤」,限价封死了最坏成交价,盘口在下单瞬间变薄只会
+    // 部分成交,不可能超买。那个 0.9 折扣纯属白让,每笔少拿约 10%。
+    let orderUsd = Math.floor(Math.min(cfg.maxOrderUsd, tokenLeft, dailyLeft, totalLeft, eventLeft, depthUsd));
     if (orderUsd < cfg.minOrderUsd) {
       return finish({
         mode,
         status: "skipped",
-        reason: `可用额度/限价内深度不足(可下 $${orderUsd},最低 $${cfg.minOrderUsd};深度 $${depthUsd.toFixed(0)})`,
+        reason:
+          `可用额度/限价内深度不足(可下 $${orderUsd},最低 $${cfg.minOrderUsd};深度 $${depthUsd.toFixed(0)}` +
+          `,token余额 $${tokenLeft.toFixed(0)}/日 $${dailyLeft.toFixed(0)}/总 $${totalLeft.toFixed(0)}` +
+          `${Number.isFinite(eventLeft) ? `/事件 $${eventLeft.toFixed(0)}` : ""})`,
         freshAsk,
         limitPrice,
       });
@@ -1082,6 +1167,7 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
       qid: input.qid,
       tokenId: input.tokenId,
       conditionId: input.conditionId,
+      ...(input.eventId ? { eventId: input.eventId } : {}),
       outcome: input.outcome,
       question: input.question?.slice(0, 160),
       mode,

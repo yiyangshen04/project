@@ -166,6 +166,9 @@ function tailLines(file: string, n: number): string[] {
 const HALT_KEY = "trading-halt";
 const PROXY_KEY = "proxy-gamma";
 const CLAUDE_KEY = "claude-login";
+const RPC_KEY = "rpc-quorum";
+const BALANCE_KEY = "pusd-balance";
+const EGRESS_KEY = "proxy-egress";
 /** 连续失败达到该次数才翻转 down(容忍单次网络抖动)。 */
 const PROBE_FAIL_THRESHOLD = 2;
 
@@ -184,6 +187,99 @@ async function probeGamma(): Promise<boolean> {
     return res.ok;
   } catch {
     return false;
+  }
+}
+
+/** RPC 法定人数(2026-08-02 复盘):chain-watch 的 eth_getLogs 是全系统唯一的
+ * 信号入口,4 路冗余里 nodies 已被付费墙挡死(实测 3/3 403)。而原有告警按
+ * marker 文件 mtime 判活,需要连续 5 个 tick 全挂才翻 down —— 一周约 6 次的
+ * 散点 fatal 永远够不到门槛。这里逐个探,活的少于 2 路即告警。
+ * 用 eth_blockNumber 而非 getLogs:后者各家的窗口/地址过滤限制不同,
+ * 会把"策略不同"误报成"端点已死"(本次复盘就先踩过这个坑)。 */
+async function probeRpcQuorum(): Promise<{ alive: number; total: number; dead: string[] }> {
+  const urls = (process.env.ONCHAIN_RPC_URLS?.trim() || "")
+    .split(",")
+    .map((u) => u.trim())
+    .filter(Boolean);
+  if (urls.length === 0) return { alive: 0, total: 0, dead: [] };
+  const dead: string[] = [];
+  let alive = 0;
+  await Promise.all(
+    urls.map(async (u) => {
+      try {
+        const res = await fetch(u, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_blockNumber", params: [] }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        const j = (await res.json()) as { result?: string; error?: unknown };
+        // 200 包着 error 也是死(1rpc 配额耗尽就是这个形态)。
+        if (res.ok && j?.error == null && typeof j?.result === "string") alive += 1;
+        else dead.push(hostOf(u));
+      } catch {
+        dead.push(hostOf(u));
+      }
+    })
+  );
+  return { alive, total: urls.length, dead };
+}
+
+/** 只取主机名 —— RPC URL 的 path 常含 API key,绝不进日志/邮件。 */
+function hostOf(u: string): string {
+  try {
+    return new URL(u).host;
+  } catch {
+    return "(unparseable)";
+  }
+}
+
+/** 抵押品余额。2026-07 底 Polymarket 把结算币从 USDC.e 换成自家 pUSD,
+ * 任何按旧 token 查余额的监控都会读到 0 并误判"没钱了"。 */
+const PUSD_ADDRESS = (process.env.PUSD_ADDRESS?.trim() || "0xc011a7e12A19F7b1F670D46f03b03f3342e82dfb").toLowerCase();
+
+async function probeCollateralBalance(): Promise<number | null> {
+  const funder = process.env.EXEC_FUNDER?.trim() || "0x3a60750796A52e84DA325B74C5ad5c031f296Db9";
+  const urls = (process.env.ONCHAIN_RPC_URLS?.trim() || "https://polygon.drpc.org")
+    .split(",")
+    .map((u) => u.trim())
+    .filter(Boolean);
+  // balanceOf(address) = 0x70a08231
+  const data = `0x70a08231${funder.replace(/^0x/, "").toLowerCase().padStart(64, "0")}`;
+  for (const u of urls) {
+    try {
+      const res = await fetch(u, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "eth_call",
+          params: [{ to: PUSD_ADDRESS, data }, "latest"],
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const j = (await res.json()) as { result?: string; error?: unknown };
+      if (!res.ok || j?.error != null || typeof j?.result !== "string") continue;
+      // pUSD 是 6 位小数
+      return Number(BigInt(j.result)) / 1e6;
+    } catch {
+      // 下一个端点
+    }
+  }
+  return null;
+}
+
+/** 代理出口国别。平台对美国出口 IP 有 KYC/风控限制,Clash 节点漂到美国会让
+ * 下单静默被拒;此前完全不可见。查不到国别不算故障(fail-open)。 */
+async function probeEgressCountry(): Promise<string | null> {
+  try {
+    const res = await fetch("https://ipinfo.io/json", { signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { country?: string };
+    return typeof j.country === "string" ? j.country : null;
+  } catch {
+    return null;
   }
 }
 
@@ -323,6 +419,73 @@ async function watch(): Promise<void> {
     }
   }
 
+  // 探针 4:RPC 法定人数(2026-08-02)。信号入口的冗余度必须可见。
+  {
+    const { alive, total, dead } = await probeRpcQuorum();
+    if (total > 0) {
+      const ok = alive >= 2;
+      const fails = ok ? 0 : (state.probeFails[RPC_KEY] ?? 0) + 1;
+      state.probeFails[RPC_KEY] = fails;
+      const down = fails >= PROBE_FAIL_THRESHOLD || (!ok && state.alert[RPC_KEY]?.status === "down");
+      pushProbeEvent(
+        RPC_KEY,
+        "链上 RPC 冗余度",
+        down,
+        `可用 RPC 仅剩 ${alive}/${total} 路(失败:${dead.join(", ") || "—"})。eth_getLogs 是全系统唯一的信号入口,冗余耗尽即链上告警完全失明。请更换端点或接入付费 RPC。`,
+        "RPC 冗余度已恢复(≥2 路可用)。"
+      );
+      summary[RPC_KEY] = down
+        ? `down(${alive}/${total})`
+        : dead.length > 0
+          ? `degraded(${alive}/${total};死:${dead.join("/")})`
+          : `ok(${alive}/${total})`;
+    }
+  }
+
+  // 探针 5:抵押品余额(pUSD)。低于两笔单的量即预警 —— 余额不足会让整批
+  // 绿档信号静默变成 "余额不足" skip。
+  {
+    const bal = await probeCollateralBalance();
+    if (bal != null) {
+      const floor = Number(process.env.EXEC_MAX_ORDER_USD || 50) * 2;
+      const low = bal < floor;
+      const fails = low ? (state.probeFails[BALANCE_KEY] ?? 0) + 1 : 0;
+      state.probeFails[BALANCE_KEY] = fails;
+      const down = fails >= PROBE_FAIL_THRESHOLD || (low && state.alert[BALANCE_KEY]?.status === "down");
+      pushProbeEvent(
+        BALANCE_KEY,
+        "抵押品余额(pUSD)",
+        down,
+        `proxy 余额 ${bal.toFixed(2)} pUSD < 两笔单的量($${floor})。自动下单会退化成"余额不足"skip;若同时有已结算未回款的持仓,检查平台 relayer 赎回是否停摆。`,
+        "pUSD 余额已恢复到安全水位。"
+      );
+      summary[BALANCE_KEY] = `${bal.toFixed(2)} pUSD${low ? " ⚠低" : ""}`;
+    } else {
+      summary[BALANCE_KEY] = "unknown(RPC 均不可用)";
+    }
+  }
+
+  // 探针 6:代理出口国别(fail-open,查不到不告警)。
+  {
+    const cc = await probeEgressCountry();
+    if (cc) {
+      const bad = cc.toUpperCase() === "US";
+      const fails = bad ? (state.probeFails[EGRESS_KEY] ?? 0) + 1 : 0;
+      state.probeFails[EGRESS_KEY] = fails;
+      const down = fails >= PROBE_FAIL_THRESHOLD || (bad && state.alert[EGRESS_KEY]?.status === "down");
+      pushProbeEvent(
+        EGRESS_KEY,
+        "代理出口国别",
+        down,
+        `代理出口 IP 落在 ${cc} —— Polymarket 对美国出口有 KYC/风控限制,下单可能被静默拒绝。请切换 Clash 节点到非美地区。`,
+        "代理出口已切回非美地区。"
+      );
+      summary[EGRESS_KEY] = bad ? `${cc} ⚠` : cc;
+    } else {
+      summary[EGRESS_KEY] = "unknown";
+    }
+  }
+
   for (const ch of CHANNELS) {
     const last = lastOkAt(ch);
     const prev = state.alert[ch.key]?.status ?? "ok";
@@ -444,9 +607,19 @@ interface ChainStats {
   fatalTicks: number;
   partialTicks: number;
   events: number;
+  eventsContext: number;
   notified: number;
   directional: number;
   gapBlocks: number;
+  /** 业务活性(2026-08-02):告警面此前全是"进程/依赖还活着",
+   * "跑着但一笔都不做"完全透明。这几个数进日报并设阈值。 */
+  execChecked: number;
+  llmCliCalls: number;
+  llmSkipped: number;
+  tradeAttempts: number;
+  tradeFilled: number;
+  paperRegistered: number;
+  llmEvicted: number;
 }
 
 interface ScanStats {
@@ -487,7 +660,11 @@ function readNewLog(
 }
 
 function chainStats(content: string): ChainStats {
-  const s: ChainStats = { okTicks: 0, fatalTicks: 0, partialTicks: 0, events: 0, notified: 0, directional: 0, gapBlocks: 0 };
+  const s: ChainStats = {
+    okTicks: 0, fatalTicks: 0, partialTicks: 0, events: 0, eventsContext: 0, notified: 0,
+    directional: 0, gapBlocks: 0, execChecked: 0, llmCliCalls: 0, llmSkipped: 0,
+    tradeAttempts: 0, tradeFilled: 0, paperRegistered: 0, llmEvicted: 0,
+  };
   for (const line of content.split("\n")) {
     if (line.includes("] fatal:")) {
       s.fatalTicks += 1;
@@ -496,12 +673,25 @@ function chainStats(content: string): ChainStats {
     if (!line.startsWith("{")) continue;
     try {
       const j = JSON.parse(line);
+      if (j.mode === "chain-watch-llm-evicted") {
+        s.llmEvicted += Number(j.evicted) || 0;
+        continue;
+      }
       if (j.mode !== "chain-watch") continue;
       s.okTicks += 1;
       s.events += Number(j.events) || 0;
+      s.eventsContext += Number(j.events_context) || 0;
       s.notified += Number(j.notified) || 0;
-      s.directional += Number(j.directional) || 0;
+      // 2026-08-02 修正:tick 行发的字段是 llm_backed,这里原来读的是不存在的
+      // j.directional —— 日报的"方向性"一栏因此长期恒为 0,没人发现。
+      s.directional += Number(j.llm_backed) || 0;
       s.gapBlocks += Number(j.gap) || 0;
+      s.execChecked += Number(j.exec_checked) || 0;
+      s.llmCliCalls += Number(j.llm_cli_calls) || 0;
+      s.llmSkipped += Number(j.llm_skipped) || 0;
+      s.tradeAttempts += Number(j.trade_attempts) || 0;
+      s.tradeFilled += Number(j.trade_filled) || 0;
+      s.paperRegistered += Number(j.paper_registered) || 0;
       if (j.sweep_error) s.partialTicks += 1;
     } catch {
       // 非 JSON 行(堆栈等)忽略
@@ -580,7 +770,10 @@ async function daily(): Promise<void> {
   });
   const probesDown = probes.filter((p) => p.down);
 
-  const subject = `[PredEdge 日报] ${probesDown.length > 0 ? `⛔探针down×${probesDown.length} · ` : ""}哨兵 ${cs.okTicks}✓/${cs.fatalTicks}✗ · 巡逻 ${ss.fullOk}✓/${ss.gammaUnreachable}✗ — ${fmtTime(now).slice(5, 16)}`;
+  // 业务活性静默失效(2026-08-02):"有官方文本却一次判读都没发生"是最危险的
+  // 形态 —— 进程全绿、邮件全绿,而 🟢 双确认档实质停摆。必须上主题级。
+  const llmDead = cs.eventsContext > 0 && cs.llmCliCalls === 0;
+  const subject = `[PredEdge 日报] ${llmDead ? "⛔判读停摆 · " : ""}${probesDown.length > 0 ? `⛔探针down×${probesDown.length} · ` : ""}哨兵 ${cs.okTicks}✓/${cs.fatalTicks}✗ · 巡逻 ${ss.fullOk}✓/${ss.gammaUnreachable}✗ — ${fmtTime(now).slice(5, 16)}`;
 
   const row = (k: string, v: string) =>
     `<tr><td style="padding:4px 12px 4px 0;color:#9aa3ad;white-space:nowrap">${k}</td><td style="padding:4px 0">${v}</td></tr>`;
@@ -593,8 +786,24 @@ async function daily(): Promise<void> {
   <h3 style="margin:10px 0 4px;font-size:14px;color:#7dd3fc">通道一 chain-watch(哨兵,3 分钟)</h3>
   <table style="font-size:13px;border-collapse:collapse">
     ${row("成功 / 失败 tick", `${cs.okTicks} / <span style="color:${cs.fatalTicks > 0 ? "#fbbf24" : "#34d399"}">${cs.fatalTicks}</span>${cs.partialTicks > 0 ? `(另有 ${cs.partialTicks} 次部分成功)` : ""}`)}
-    ${row("链上事件 / 已通知 / 官方方向", `${cs.events} / ${cs.notified} / ${cs.directional}`)}
-    ${row("永久漏块", `${cs.gapBlocks} 块 ≈ ${gapMinutes} 分钟链上时间`)}
+    ${row("链上事件 / 官方澄清 / 已通知 / 双确认", `${cs.events} / ${cs.eventsContext} / ${cs.notified} / ${cs.directional}`)}
+    ${row(
+      "业务活性(注解/判读/跳过)",
+      `${cs.execChecked} / ${cs.llmCliCalls} / ${cs.llmSkipped}` +
+        (cs.eventsContext > 0 && cs.llmCliCalls === 0
+          ? ' <span style="color:#f87171">⛔ 有官方文本却零判读 —— 判读链路可能已死</span>'
+          : "")
+    )}
+    ${row(
+      "执行(尝试/成交/paper 登记)",
+      `${cs.tradeAttempts} / ${cs.tradeFilled} / ${cs.paperRegistered}`
+    )}
+    ${row(
+      "永久漏块",
+      `${cs.gapBlocks} 块 ≈ ${gapMinutes} 分钟链上时间` +
+        (cs.fatalTicks >= 3 ? ` · <span style="color:#fbbf24">⚠ fatal tick ${cs.fatalTicks} 次(检查 RPC)</span>` : "")
+    )}
+    ${cs.llmEvicted > 0 ? row("判读队列淘汰", `<span style="color:#fbbf24">${cs.llmEvicted} 条(队列超限,不再补判)</span>`) : ""}
     ${row("最后成功", chainLast ? `${fmtTime(chainLast)}(${ageMinutes(chainLast)} 分钟前)` : '<span style="color:#f87171">无记录</span>')}
   </table>
 
@@ -626,7 +835,7 @@ async function daily(): Promise<void> {
 
   const text = [
     `统计区间 ${periodFrom} → ${fmtTime(now)}`,
-    `chain-watch: ok=${cs.okTicks} fatal=${cs.fatalTicks} partial=${cs.partialTicks} events=${cs.events} notified=${cs.notified} directional=${cs.directional} gap=${cs.gapBlocks}`,
+    `chain-watch: ok=${cs.okTicks} fatal=${cs.fatalTicks} partial=${cs.partialTicks} events=${cs.events} ctx=${cs.eventsContext} notified=${cs.notified} directional=${cs.directional} gap=${cs.gapBlocks} exec=${cs.execChecked} llm=${cs.llmCliCalls}/${cs.llmSkipped} trades=${cs.tradeAttempts}/${cs.tradeFilled} paper=${cs.paperRegistered} evicted=${cs.llmEvicted}`,
     `scan-notify: starts=${ss.starts} fullOk=${ss.fullOk} unreachable=${ss.gammaUnreachable} mails=${ss.mailsSent}`,
     `probes: ${probes.map((p) => `${p.label}=${p.disp}`).join(" | ")}`,
     hcConfigured ? "HC ping: all 3 configured" : "HC ping: NOT fully configured",

@@ -76,7 +76,10 @@ const VALID_CONFIDENCE = new Set(["high", "medium", "low", "none"]);
 const UPDATE_MAX_CHARS = 2_000;
 const UPDATES_TOTAL_MAX_CHARS = 12_000;
 
-const CACHE_MAX_ENTRIES = 300;
+/** 2026-07-31 模板洪水(单日 1,311 事件)一次就把 300 条上限写满,洪水前的
+ * 全部判读历史被 LRU 挤光 —— 判读留痕是 go/no-go 的原始样本,不能被一天的
+ * 模板盘冲掉。纯本地 JSON,3000 条约 1.2MB,体积可忽略。 */
+const CACHE_MAX_ENTRIES = 3_000;
 
 /** Replaces Claude Code's default (coding-agent) system prompt — that prompt
  * plus ~/.claude/CLAUDE.md user memory is pure noise for a classification
@@ -154,6 +157,16 @@ function loadCache(): CacheFile {
   } catch {
     return {}; // absent or corrupt — cache is best-effort, never load-bearing
   }
+}
+
+/** 进程内单例。原实现每次调用都 loadCache() 从磁盘重读、改完再写回 ——
+ * 串行时正确,但并发判读下就是 read-modify-write 竞态:两个并发调用各自读到
+ * 旧快照,后写的那个会抹掉先写的裁定。单例化后所有调用共享同一对象,
+ * saveCache 是同步写(await 之间不会交错),并发安全。 */
+let cacheSingleton: CacheFile | null = null;
+function getCache(): CacheFile {
+  if (cacheSingleton == null) cacheSingleton = loadCache();
+  return cacheSingleton;
 }
 
 function saveCache(cache: CacheFile): void {
@@ -314,7 +327,40 @@ function parseVerdict(raw: string, sources: string[]): LlmStanceVerdict | null {
   return { stance, confidence, evidence, reasoning, eventStatus, via: "llm" };
 }
 
-function runClaude(prompt: string, timeoutMs: number): Promise<string> {
+/** 终局故障(重试无意义):CLI 不存在、未登录/凭据失效、参数不被接受。
+ * 其余(超时、代理半开、连接重置、5xx/限流)一律按瞬断处理 —— 2026-07-27/28
+ * 判读线路两次中断(17h + 3h)期间,单次失败就把整个 tick 的判读关掉,而
+ * preArm 命中的伊朗停火家族三条腿恰好落在窗口里,全部拿到 llm:"unavailable"。 */
+function isTerminalLlmFailure(msg: string): boolean {
+  const m = msg.toLowerCase();
+  return (
+    /enoent|command not found|not found in \$?path/.test(m) ||
+    /not logged in|unauthorized|401|invalid api key|authentication/.test(m) ||
+    /unknown option|unrecognized option|invalid argument/.test(m)
+  );
+}
+
+/** 代理候选:主线路(环境里的 HTTPS_PROXY)之外再给一条备线。
+ * LLM_PROXY_FALLBACK 为空则只有主线路。返回的每一项是要覆盖进子进程环境的
+ * 代理变量集合;undefined 表示"原样沿用父进程设置"。 */
+function proxyCandidates(): Array<Record<string, string> | undefined> {
+  const out: Array<Record<string, string> | undefined> = [undefined];
+  const fb = process.env.LLM_PROXY_FALLBACK?.trim();
+  if (fb) {
+    out.push({ HTTPS_PROXY: fb, HTTP_PROXY: fb, https_proxy: fb, http_proxy: fb });
+  }
+  // 直连兜底只在显式开启时启用:sufe 上直连必 403(排障铁律),默认不浪费一轮。
+  if ((process.env.LLM_PROXY_ALLOW_DIRECT ?? "").trim().toLowerCase() === "on") {
+    out.push({ HTTPS_PROXY: "", HTTP_PROXY: "", https_proxy: "", http_proxy: "" });
+  }
+  return out;
+}
+
+function runClaude(
+  prompt: string,
+  timeoutMs: number,
+  proxyOverride?: Record<string, string>
+): Promise<string> {
   const bin = process.env.CLAUDE_BIN?.trim() || "claude";
   // --tools "" disables ALL built-in tools (pure single-shot classification,
   // no agentic loop for injected text to steer); --strict-mcp-config keeps
@@ -340,6 +386,8 @@ function runClaude(prompt: string, timeoutMs: number): Promise<string> {
     const v = process.env[k];
     if (v !== undefined) childEnv[k] = v;
   }
+  // 备用代理:只覆盖代理变量,允许清空(空串 = 直连);其余环境沿用允许清单。
+  if (proxyOverride) for (const [k, v] of Object.entries(proxyOverride)) childEnv[k] = v;
   cliCalls += 1;
   return new Promise((resolve, reject) => {
     const child = execFile(
@@ -396,7 +444,7 @@ export async function classifyStanceWithLlm(input: {
   // stale-prompt verdict for a new event. Unprefixed v3-era entries simply
   // never hit again and age out through the LRU cap.
   const cacheKey = `v${PROMPT_VERSION}:${input.cacheKey}`;
-  const cache = loadCache();
+  const cache = getCache();
   const cached = cache[cacheKey];
   if (cached) {
     // delete-then-set: refresh insertion position so saveCache's front-prune
@@ -417,15 +465,52 @@ export async function classifyStanceWithLlm(input: {
   const envTimeoutMs = Number(process.env.LLM_STANCE_TIMEOUT_MS) || 60_000;
   const timeoutMs = Math.min(envTimeoutMs, input.timeoutMs ?? envTimeoutMs);
   const prompt = buildPrompt(input);
-  let stdout: string;
-  try {
-    stdout = await runClaude(prompt, timeoutMs);
-  } catch (err) {
+  // 立即重试 + 代理切换(2026-08-02):原实现单次失败即 disabledThisProcess,
+  // 整个 tick 的判读全关、等下一个 cron tick 才有机会重来。而 preArm 的承诺
+  // 窗口只有 15 分钟 —— 等不起。瞬断在窗口内当场重试(可切备用代理),终局
+  // 故障(未登录/CLI 缺失)才关闭本 tick,避免白烧超时。
+  const candidates = proxyCandidates();
+  const maxTries = Math.max(1, Number(process.env.LLM_STANCE_MAX_TRIES) || 3);
+  const backoffMs = Math.max(0, Number(process.env.LLM_STANCE_RETRY_BACKOFF_MS) || 1_500);
+  const deadline = Date.now() + timeoutMs;
+  let stdout: string | null = null;
+  let lastErr = "";
+  for (let attempt = 0; attempt < maxTries; attempt += 1) {
+    const proxy = candidates[Math.min(attempt, candidates.length - 1)];
+    // 每次尝试的超时受总预算约束:重试绝不把 tick 拖过 SIGTERM。
+    const leftMs = deadline - Date.now();
+    if (leftMs < 5_000) {
+      lastErr = lastErr || "budget exhausted before retry";
+      break;
+    }
+    try {
+      stdout = await runClaude(prompt, Math.min(timeoutMs, leftMs), proxy);
+      break;
+    } catch (err) {
+      lastErr = err instanceof Error ? err.message : String(err);
+      if (isTerminalLlmFailure(lastErr)) {
+        disabledThisProcess = true;
+        console.warn(
+          `[llm-stance] terminal CLI failure for ${input.cacheKey} (LLM gate off for this tick): ${lastErr}`
+        );
+        return null;
+      }
+      console.warn(
+        `[llm-stance] transient CLI failure for ${input.cacheKey} (try ${attempt + 1}/${maxTries}${
+          proxy ? ", proxy fallback" : ""
+        }): ${lastErr.slice(0, 200)}`
+      );
+      if (attempt + 1 < maxTries && backoffMs > 0 && deadline - Date.now() > backoffMs + 5_000) {
+        await new Promise((r) => setTimeout(r, backoffMs));
+      }
+    }
+  }
+  if (stdout == null) {
+    // 全部尝试都失败:本 tick 不再对其他事件重复烧预算,但这是瞬断而非终局,
+    // 下个 tick 会重来(llmPending 亦会补判)。
     disabledThisProcess = true;
     console.warn(
-      `[llm-stance] claude CLI call failed for ${input.cacheKey} (falling back to regex-only gate for this tick): ${
-        err instanceof Error ? err.message : String(err)
-      }`
+      `[llm-stance] claude CLI call failed for ${input.cacheKey} after ${maxTries} tries (falling back to regex-only gate for this tick): ${lastErr}`
     );
     return null;
   }

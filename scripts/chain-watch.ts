@@ -40,7 +40,7 @@
  *      CHAIN_WATCH_STATE (default data/chain-watch-state.json),
  *      CHAIN_WATCH_PREARM=off (P1 总开关)
  */
-import { readFileSync } from "fs";
+import { readFileSync, appendFileSync, mkdirSync } from "fs";
 import path from "path";
 import { sendMail } from "./mailer";
 import { ethCall } from "../lib/polymarket/oracleState";
@@ -153,6 +153,16 @@ const EXEC_ANNOTATE_MAX = 12;
 
 /** P1 总开关:预告时点预埋 + 承诺窗口快轮询。 */
 const PREARM_ENABLED = (process.env.CHAIN_WATCH_PREARM ?? "").trim().toLowerCase() !== "off";
+/** 成交后补仓复访(2026-08-02 复盘)。开关默认开;关掉即回到"买过就永久不碰"
+ * 的旧行为。窗口取 12 分钟:07-28 实测卖家补货集中在成交后 39s–4.5min,
+ * 12 分钟覆盖该形态且仍远短于结算时间。 */
+const REFILL_ENABLED = (process.env.CHAIN_WATCH_REFILL ?? "").trim().toLowerCase() !== "off";
+const REFILL_WINDOW_MS = Number(process.env.CHAIN_WATCH_REFILL_WINDOW_MS) || 12 * 60_000;
+/** 每个 token 最多复访几次。3 次 × 3min tick ≈ 覆盖整个窗口;上限防止某个
+ * 长期薄簿的 token 每 tick 都白跑一次盘口请求。 */
+const REFILL_MAX_TRIES = Number(process.env.CHAIN_WATCH_REFILL_MAX_TRIES) || 4;
+/** 单 tick 最多复访几个 token(预算保护:复访排在新信号之后)。 */
+const REFILL_MAX_PER_TICK = 4;
 /** 预埋名单上限。bt5 实测 15 个月 80 个市场,批量裁定日一次可预埋数十个姊妹市场。 */
 const PREARM_MAX = 80;
 /** 承诺时点前多早进入快轮询。官方偶有提前 1-2 分钟落文本。 */
@@ -298,6 +308,34 @@ interface DigestEntry {
  * The entry is the durable contract — the heads-up mail is best-effort
  * (mailedAt marks success, absent = retry next tick), the in-window fast
  * poll is what actually converts the 1.55h lead into seconds-level reaction. */
+/** 成交后补仓复访的重放快照:够重建一次 executeSignal 调用即可。 */
+interface RefillEntry {
+  qid: string;
+  tokenId: string;
+  conditionId: string;
+  eventId: string | null;
+  outcome: string;
+  question: string;
+  marketUrl: string | null;
+  label: string;
+  stance: string;
+  llmStance: string | null;
+  llmConfidence: string | null;
+  llmEventStatus: string | null;
+  /** 漂移带的锚 —— 恒取原始信号价,价格跑掉时复访会被漂移带自然拒绝。 */
+  bestAskAtSignal: number | null;
+  declarative: boolean;
+  dirMethod: string;
+  negRisk: boolean;
+  feesEnabled: boolean | null;
+  feeRate: number | null;
+  forecastTemplate: boolean;
+  /** 队列过期时点(epoch-ms)。 */
+  expiresAt: number;
+  /** 已复访次数(上限 REFILL_MAX_TRIES)。 */
+  tries: number;
+}
+
 interface PreArmEntry {
   adapter: string;
   title: string | null;
@@ -346,6 +384,15 @@ interface WatchState {
   v2Watch: Record<string, V2WatchEntry>;
   /** qid → P1 预告时点预埋名单(see PreArmEntry). */
   preArm: Record<string, PreArmEntry>;
+  /** tokenId → 成交后补仓复访名单(2026-08-02 复盘)。
+   * 07-28 那笔成交($47,受当刻限价内深度 ~$52 约束)之后 4.5 分钟内,同一个盘
+   * 陆续新挂出约 85 股 ≤0.69 的货 —— 全部落在我方当时的限价之内 —— 被另外三
+   * 个买家吃走并全部按 $1 结算。信号不会为此重新触发,所以引擎对"卖家补货"
+   * 完全失明。这个队列让成交过的 token 在短窗口内每 tick 重探一次盘口。
+   * 安全性:复访直接复用 executeSignal,kill-switch/连亏熔断/价格带/漂移带/
+   * per-token 与同事件敞口帽全部原样再过一遍;漂移锚仍是原始信号价,价格跑掉
+   * 就会被漂移带拒绝。总敞口由 perTokenMaxUsd 封死。 */
+  refillQueue?: Record<string, RefillEntry>;
   /** Held-back directional events awaiting the digest mail. */
   digestQueue: DigestEntry[];
   /** Epoch-ms timestamps of immediately-mailed directional items (flood detector). */
@@ -366,13 +413,34 @@ function statePath(): string {
   return path.join(process.cwd(), "data", "chain-watch-state.json");
 }
 
+/** 执行尝试的独立留痕(2026-08-02 复盘)。日志每周日被 `tail -c` 丢弃式截断,
+ * 而前置 skip 分支在 executeSignal 之前 return、ledger 里没有对应行 —— 这条
+ * append-only 文件是这批决策记录唯一不受轮转影响的落盘去处,也是 8 月 go/no-go
+ * 的样本源。fail-open:写失败只 warn,绝不影响告警与下单路径。 */
+function appendTradeForensics(row: Record<string, unknown>): void {
+  try {
+    const configured = process.env.TRADE_FORENSICS?.trim();
+    const file = configured
+      ? path.isAbsolute(configured)
+        ? configured
+        : path.join(process.cwd(), configured)
+      : path.join(process.cwd(), "data", "trade-attempts.jsonl");
+    mkdirSync(path.dirname(file), { recursive: true });
+    appendFileSync(file, `${JSON.stringify(row)}\n`);
+  } catch (err) {
+    console.warn(
+      `[chain-watch] 执行留痕写入失败(不阻塞): ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+
 function loadState(): WatchState {
   let raw: string;
   try {
     raw = readFileSync(statePath(), "utf8");
   } catch {
     // first run — file absent
-    return { lastBlock: 0, notified: {}, llmPending: {}, pendingEnrich: {}, v2Watch: {}, preArm: {}, digestQueue: [], mailLog: [], resetSeen: {} };
+    return { lastBlock: 0, notified: {}, llmPending: {}, pendingEnrich: {}, v2Watch: {}, preArm: {}, digestQueue: [], mailLog: [], resetSeen: {}, refillQueue: {} };
   }
   try {
     const parsed = JSON.parse(raw);
@@ -388,6 +456,8 @@ function loadState(): WatchState {
       digestQueue: Array.isArray(parsed.digestQueue) ? parsed.digestQueue : [],
       mailLog: Array.isArray(parsed.mailLog) ? parsed.mailLog.filter((t: unknown) => Number.isFinite(t)) : [],
       resetSeen: parsed.resetSeen && typeof parsed.resetSeen === "object" ? parsed.resetSeen : {},
+      refillQueue:
+        parsed.refillQueue && typeof parsed.refillQueue === "object" ? parsed.refillQueue : {},
       pendingGapAlert:
         parsed.pendingGapAlert && typeof parsed.pendingGapAlert === "object"
           ? parsed.pendingGapAlert
@@ -446,6 +516,9 @@ interface Notable {
   description: string | null;
   stance: string;
   confidence: string;
+  /** 宣告类裁定("will/should resolve to X",历史兑现 98.8%)—— 执行侧的
+   * 宣告扫单模式闸门。前瞻/边界澄清一律 false。 */
+  declarative?: boolean;
   refundClause: boolean;
   excerpt: string | null;
   updateCount: number;
@@ -520,6 +593,7 @@ function applyStanceFromUpdates(item: Notable): void {
     if (isDirectionalStance(classified.stance)) {
       item.stance = classified.stance;
       item.confidence = classified.confidence;
+      item.declarative = classified.declarative === true;
       item.excerpt = item.updates[i].text.slice(0, 400);
       return;
     }
@@ -529,6 +603,7 @@ function applyStanceFromUpdates(item: Notable): void {
     const classified = stanceFromText(latest.text);
     item.stance = classified.stance;
     item.confidence = classified.confidence;
+    item.declarative = classified.declarative === true;
     item.excerpt = latest.text.slice(0, 400);
   }
 }
@@ -553,6 +628,7 @@ async function main(): Promise<void> {
     console.log(
       JSON.stringify({
         mode: "chain-watch-config",
+        at: new Date().toISOString(),
         exec_mode: ec.mode,
         max_order_usd: ec.maxOrderUsd,
         daily_max_usd: ec.dailyMaxUsd,
@@ -583,6 +659,9 @@ async function main(): Promise<void> {
     maxAdvance: MAX_HEAD_ADVANCE,
   });
 
+  /** 本 tick 放弃补判的"已发 🟠 待绿档升级"事件 —— flushLlmGiveUpAlert 即时发信。 */
+  const pendingLlmGiveUpAlerts: Array<{ qid: string; title: string | null; attempts: number }> = [];
+
   const elapsed = () => Date.now() - tickStartedAt;
   // 硬预算:SIGTERM 前的真实剩余。快轮询的决策与单次调用的超时钳制用它。
   const wallBudgetLeftMs = () => TICK_KILL_MS - SEND_MARGIN_MS - elapsed();
@@ -608,7 +687,9 @@ async function main(): Promise<void> {
     // 那会吞掉整个在窗 tick 的快轮询驻留(审查确认:滞后副本恰落在承诺时点
     // 附近时,P1 秒级覆盖被打成 3min 盲洞)。带空扫描范围继续走到尾部。
     if (!prearmWindowSoon()) {
-      console.log(JSON.stringify({ mode: "chain-watch", head, skipped: "no new blocks" }));
+      console.log(
+        JSON.stringify({ mode: "chain-watch", at: new Date().toISOString(), head, skipped: "no new blocks" })
+      );
       return;
     }
   }
@@ -672,12 +753,18 @@ async function main(): Promise<void> {
   // Group events by questionID
   const byQid = new Map<string, Notable>();
   let nonOfficialDropped = 0;
+  // tick 汇总的 events 是两类事件的和,混在一起无法判断"官方澄清供给是否
+  // 衰减"(2026-08-02 复盘:1,512 事件里 1,311 来自单日模板洪水)。分开计数。
+  let resetEventCount = 0;
+  let contextEventCount = 0;
   for (const log of logs) {
     const topic0 = log.topics?.[0]?.toLowerCase();
     const qid = log.topics?.[1]?.toLowerCase();
     if (!qid) continue;
     const kind = topic0 === TOPIC_QUESTION_RESET ? "reset" : topic0 === TOPIC_ANCILLARY_UPDATED ? "context" : null;
     if (!kind) continue;
+    if (kind === "reset") resetEventCount += 1;
+    else contextEventCount += 1;
     // owner 白名单(2026-07-14 加固):AncillaryDataUpdated 任何地址都能发,
     // 已实测对抗案例(Peng 案 troll 掐官方澄清前 4 秒抢发反向文、bot 测试
     // 文本)。topics[2]=owner;非白名单事件不触发 enrich/通知(防噪音 tick
@@ -1190,9 +1277,22 @@ async function main(): Promise<void> {
       }
     }
     p.attempts += 1;
-    if (p.attempts >= 16 || Date.now() - p.firstSeenAt > 48 * 3600_000) {
+    // 2026-08-02 复盘:原上限一律 16 次 ≈ 48 分钟(3min/tick),而注释写的是
+    // "48h 契约" —— attempts 分支永远先触发,48h 那条路实际不可达。判读线路
+    // 中断动辄数小时(07-27/28 两次:17h + 3h),48 分钟的重试窗口必然放弃。
+    // 值得追的(已按 🟠 发过信、等绿档升级)给足 48h;其余维持 16 次。
+    const worthChasing = p.mailedDirectional === true;
+    const attemptCap = worthChasing ? 1_000 : 16;
+    const ageCapMs = worthChasing ? 48 * 3600_000 : 6 * 3600_000;
+    if (p.attempts >= attemptCap || Date.now() - p.firstSeenAt > ageCapMs) {
       console.warn(`[chain-watch] llmPending ${qid} 放弃补判(attempts=${p.attempts})`);
       delete state.llmPending[qid];
+      // 放弃一个"已发 🟠、等绿档升级"的事件是可能真丢钱的事件级失效,不能只
+      // 躺在 6h 汇总里 —— 07-27/28 判读断供期间 preArm 精准命中的伊朗停火家族
+      // 就是这个形态(三条腿全部 llm:"unavailable")。升到即时主题级。
+      if (worthChasing) {
+        pendingLlmGiveUpAlerts.push({ qid, title: p.title, attempts: p.attempts });
+      }
       // M4:放弃 ≠ 静默丢弃。bt4 案例 14c9:被 null 吞掉的恰是"事后官方明写
       // qualifies for Yes"的最高置信信号。进汇总队列(非即时,不重开噪音闸)。
       state.digestQueue.push({
@@ -1218,18 +1318,36 @@ async function main(): Promise<void> {
   // LLM 复核:不拦截发信(32/32 口径的哨兵语义保留,LLM 挂了照发),但复核
   // 结果决定标题分级(🟢双确认 / 🟠LLM拒判警示),让邮箱里直接可分诊。
   // LLM 侧独立放行的方向判读要求置信 ≥medium(low 是回测里唯一漏网亏损)。
+  // 判读前置并发批(2026-08-02):原来是逐项 await,一次批量澄清里 5 条腿要串
+  // 排 90 秒,而这类机会的价格窗口只有 2-5 分钟 —— 8-12 条腿的到达形态(常见)
+  // 会让排在后面的直接过期作废。改成有界并发,谁先判完谁先用。
+  // LLM_STANCE_CONCURRENCY=1 即完全退回原来的串行语义。
+  // 前提条件已满足:判读缓存本轮已单例化(消除 read-modify-write 竞态),
+  // 且判读本身不写 ledger —— 下单仍然严格串行,资金路径并发面为零。
+  {
+    const queue = notable.filter((i) => i.updates.length > 0);
+    const width = Math.max(1, Math.min(Number(process.env.LLM_STANCE_CONCURRENCY) || 3, queue.length));
+    let cursor = 0;
+    await Promise.all(
+      Array.from({ length: width }, async () => {
+        for (;;) {
+          const i = cursor;
+          cursor += 1;
+          if (i >= queue.length) return;
+          if (llmBudgetLeftMs() < LLM_MIN_CALL_MS) {
+            llmSkipped += 1;
+            continue;
+          }
+          queue[i].llm = await consultLlm(queue[i]);
+        }
+      })
+    );
+  }
   for (const item of notable) {
     const hasText = item.updates.length > 0;
     if (!item.enriched && !hasText) {
       mailable.push(item); // 规则 3:读取失败 → 降级发信
       continue;
-    }
-    if (hasText) {
-      if (llmBudgetLeftMs() < LLM_MIN_CALL_MS) {
-        llmSkipped += 1;
-      } else {
-        item.llm = await consultLlm(item);
-      }
     }
     const regexDirectional = isDirectionalStance(item.stance);
     const llmDirectional =
@@ -1271,7 +1389,39 @@ async function main(): Promise<void> {
   {
     const pendingKeys = Object.keys(state.llmPending);
     if (pendingKeys.length > 50) {
-      for (const k of pendingKeys.slice(0, pendingKeys.length - 50)) delete state.llmPending[k];
+      // 2026-08-02 复盘:此处原为无痕 delete —— 07-31 模板洪水(单日 1,311
+      // 事件)按队列复算静默淘汰 404-413 条,而走"放弃补判"有痕路径的只有 8
+      // 条(约 2%)。与 M4 修掉的 null 吞单是同一反模式:最需要人知道的事实
+      // (队列被挤爆、这批事件永不复判)完全不可见。
+      // 洪水日被淘汰的绝大多数是 rule_context 模板盘(bt3 口径期望为负,不值
+      // 得补判),所以这里不扩容队列,只保证「丢了什么」留痕并进 digest。
+      const evicted = pendingKeys.slice(0, pendingKeys.length - 50);
+      for (const k of evicted) {
+        const e = state.llmPending[k];
+        delete state.llmPending[k];
+        state.digestQueue.push({
+          qid: k,
+          title: e?.title ?? null,
+          label: `⚠ 判读队列超限(>50)淘汰 —— 本事件不再补判(attempts=${e?.attempts ?? 0})`,
+          stance: "llm_pending_evicted",
+          llmStance: null,
+          bestAsk: null,
+          askUsd: null,
+          marketUrl: null,
+          trade: null,
+          reason: "llm_pending_evicted",
+          at: Date.now(),
+        });
+      }
+      console.log(
+        JSON.stringify({
+          mode: "chain-watch-llm-evicted",
+          at: new Date().toISOString(),
+          evicted: evicted.length,
+          kept: 50,
+          qids: evicted.slice(0, 20).map((k) => k.slice(0, 12)),
+        })
+      );
     }
   }
   for (const n of mailable) markMultiDispute(n);
@@ -1452,7 +1602,14 @@ async function main(): Promise<void> {
     // §3.4:闸门只看结构化 tier(isGreen),不解析 label 文案。
     if (!isGreen(pr)) return;
     const e = n.exec;
-    if (!e || e.closed || !e.fill100) return;
+    // 2026-08-02 复盘:门槛原为 `!e.fill100`(要求模拟吃满 $100)。实测最厚
+    // 一腿深度只有 ~$52,连唯一那笔 +48% 的真实成交都不够格登记 —— paper 池
+    // 上线至今 0 行,而 EXEC_FORECAST_LIVE 的解除条件正是"paper 验证期",
+    // 两者结构性互斥形成死锁。改为尽力口径:有任何可吃深度就登记,capped
+    // 标记进 gateMeta 供事后分层(薄簿样本不与足额样本混算均值)。
+    // 仍然排除的只有:无注解、市场已关闭、真空盘(无任何可成交深度)。
+    const fill = e?.fillAvail ?? null;
+    if (!e || e.closed || !fill) return;
     try {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const db = require("../lib/localDb") as typeof import("../lib/localDb");
@@ -1469,15 +1626,21 @@ async function main(): Promise<void> {
         outcomeBought: e.outcome,
         marketUrl: e.marketUrl,
         endDate: e.endDate,
-        usdAmount: e.fill100.usd,
-        shares: e.fill100.shares,
-        avgFillPrice: e.fill100.avgPrice,
-        worstFillPrice: e.fill100.worstPrice,
-        fills: e.fill100.fills,
+        usdAmount: fill.usd,
+        shares: fill.shares,
+        avgFillPrice: fill.avgPrice,
+        worstFillPrice: fill.worstPrice,
+        fills: fill.fills,
         dirMethod: e.dirMethod,
         gateMeta: {
           tier: pr.tier,
           label: pr.label,
+          // 薄簿分桶(2026-08-02):capped=true 表示限价内深度吃不满 $100,
+          // 这类样本的名义收益率不可与足额样本混算 —— go/no-go 分层用。
+          depthCapped: fill.capped,
+          depthUsd: Math.round(fill.usd * 100) / 100,
+          askUsdNear: e.askUsdNear,
+          executable: e.executable,
           stance: n.stance,
           confidence: n.confidence,
           llmStance: n.llm?.stance ?? null,
@@ -1521,15 +1684,36 @@ async function main(): Promise<void> {
   // 对应明细,事后只能靠 notified 指纹反推。skip 也打同构 JSON 行;ledger
   // 语义保持"executeSignal 必写"不变。
   const logTradeSkip = (n: Notable, tokenId?: string): void => {
+    const row = {
+      mode: "chain-watch-trade" as const,
+      // 2026-08-02 复盘:9/9 条执行留痕全部落在周日 `tail -c` 截断要丢弃的
+      // 头部,而前置 skip 分支在 executeSignal 之前 return、ledger 里没有
+      // 副本 —— 这些行一旦被截断就彻底消失(本次复盘只能靠链上考古反推)。
+      at: new Date().toISOString(),
+      qid: n.qid,
+      token: tokenId,
+      question: n.title ?? n.exec?.question ?? null,
+      conditionId: n.exec?.conditionId ?? null,
+      marketUrl: n.exec?.marketUrl ?? null,
+      endDate: n.exec?.endDate ?? null,
+      tier: priorityOf(n).tier,
+      label: priorityOf(n).label,
+      bestAsk: n.exec?.bestAsk ?? null,
+      bookEmpty: n.exec?.bookEmpty ?? null,
+      status: n.trade?.status,
+      reason: n.trade?.reason,
+    };
     console.log(
       JSON.stringify({
-        mode: "chain-watch-trade",
+        mode: row.mode,
+        at: row.at,
         qid: n.qid.slice(0, 12),
         token: tokenId ? tokenId.slice(0, 12) : undefined,
-        status: n.trade?.status,
-        reason: n.trade?.reason,
+        status: row.status,
+        reason: row.reason,
       })
     );
+    appendTradeForensics(row);
   };
   // anchorAskOverride(§13,仅 P1 快路径传):跨轮传递的首轮盘口锚,取代
   // 本轮 exec.bestAsk 作为执行漂移带的基准。undefined = 用本轮注解。
@@ -1595,6 +1779,11 @@ async function main(): Promise<void> {
         // 空盘留痕恒取本轮注解:锚为 null 时,本轮 book 空 = taker 现在就
         // 买不进(空盘口径);本轮有挂单 = 仅缺漂移基准(人工确认口径)。
         bookEmpty: e.bookEmpty,
+        // 宣告扫单闸门:只有官方文本直接宣布结算结果的子类才放宽限价帽
+        // (98.8% 兑现);预告/边界澄清一律走原来的绝对滑点带。
+        declarative: n.declarative === true,
+        // 同事件聚合敞口帽的键(兄弟腿共享同一 Gamma event)。
+        eventId: e.eventId,
         dirMethod: e.dirMethod,
         negRisk: e.negRisk,
         // taker 费注解透传(2026-07-19 审查 §2:execCheck 取到了却在此丢弃,
@@ -1605,9 +1794,45 @@ async function main(): Promise<void> {
         correction: n.correction === true,
         budgetMs: wallBudgetLeftMs(),
       });
+      // 成交即进补仓复访名单(2026-08-02):卖家补货不会重新触发信号,引擎
+      // 必须自己回头看。只有真成交才入队 —— skip/none/拒单不需要复访。
+      if (
+        REFILL_ENABLED &&
+        (n.trade.status === "filled" || n.trade.status === "partial") &&
+        executionMode() === "live"
+      ) {
+        state.refillQueue = state.refillQueue ?? {};
+        const prev = state.refillQueue[e.tokenId];
+        state.refillQueue[e.tokenId] = {
+          qid: n.qid,
+          tokenId: e.tokenId,
+          conditionId: e.conditionId,
+          eventId: e.eventId,
+          outcome: e.outcome,
+          question: e.question,
+          marketUrl: e.marketUrl,
+          label: pr.label,
+          stance: n.stance,
+          llmStance: n.llm?.stance ?? null,
+          llmConfidence: n.llm?.confidence ?? null,
+          llmEventStatus: n.llm?.eventStatus ?? null,
+          // 锚恒取原始信号价:复访时价格若已跑出漂移带,executeSignal 自己会拒。
+          bestAskAtSignal: prev?.bestAskAtSignal ?? (anchorAskOverride !== undefined ? anchorAskOverride : e.bestAsk),
+          declarative: n.declarative === true,
+          dirMethod: e.dirMethod,
+          negRisk: e.negRisk,
+          feesEnabled: e.feesEnabled,
+          feeRate: e.feeRate,
+          forecastTemplate: n.forecastTemplate === true,
+          expiresAt: prev?.expiresAt ?? Date.now() + REFILL_WINDOW_MS,
+          tries: prev?.tries ?? 0,
+        };
+      }
+      const at = new Date().toISOString();
       console.log(
         JSON.stringify({
           mode: "chain-watch-trade",
+          at,
           qid: n.qid.slice(0, 12),
           token: e.tokenId.slice(0, 12),
           status: n.trade.status,
@@ -1617,6 +1842,28 @@ async function main(): Promise<void> {
           latencyMs: n.trade.latencyMs,
         })
       );
+      appendTradeForensics({
+        mode: "chain-watch-trade",
+        at,
+        qid: n.qid,
+        token: e.tokenId,
+        question: e.question,
+        conditionId: e.conditionId,
+        marketUrl: e.marketUrl,
+        endDate: e.endDate,
+        tier: pr.tier,
+        label: pr.label,
+        bestAsk: e.bestAsk,
+        bookEmpty: e.bookEmpty ?? null,
+        status: n.trade.status,
+        reason: n.trade.reason,
+        usd: n.trade.filledUsd ?? n.trade.requestedUsd,
+        avgPrice: n.trade.avgPrice,
+        limitPrice: n.trade.limitPrice,
+        freshAsk: n.trade.freshAsk,
+        feeUsd: n.trade.feeUsd,
+        latencyMs: n.trade.latencyMs,
+      });
     } catch (err) {
       // executeSignal 自身兜底不 throw;这里是双保险
       console.warn(
@@ -1625,6 +1872,97 @@ async function main(): Promise<void> {
     }
   };
   for (const n of mailable) await maybeExecuteTrade(n);
+
+  // ── 成交后补仓复访(2026-08-02 复盘)──
+  // 07-28:成交后 39s 起卖家陆续补货,4.5 分钟内约 85 股 ≤ 我方限价的卖单被
+  // 他人吃走并全部结算 $1。信号不会重复触发,所以引擎必须自己回头看盘口。
+  // 排在新信号之后:补仓永远不许挤占新机会的 tick 预算。
+  const sweepRefillQueue = async (): Promise<void> => {
+    if (!REFILL_ENABLED || executionMode() !== "live") return;
+    const queue = state.refillQueue;
+    if (!queue) return;
+    const now = Date.now();
+    let done = 0;
+    for (const [tokenId, r] of Object.entries(queue)) {
+      if (now > r.expiresAt || r.tries >= REFILL_MAX_TRIES) {
+        delete queue[tokenId];
+        continue;
+      }
+      if (done >= REFILL_MAX_PER_TICK || wallBudgetLeftMs() < 45_000) break;
+      r.tries += 1;
+      done += 1;
+      try {
+        // 复用 executeSignal:kill-switch、连亏熔断、价格带、漂移带/暴跌守卫、
+        // per-token 与同事件敞口帽、日/总额度全部原样再过一遍。补仓量由
+        // perTokenMaxUsd − 已有敞口 封死,不会放大总风险。
+        const attempt = await executeSignal({
+          qid: r.qid,
+          tokenId: r.tokenId,
+          conditionId: r.conditionId,
+          eventId: r.eventId,
+          outcome: r.outcome,
+          question: r.question,
+          marketUrl: r.marketUrl,
+          label: `${r.label} ♻补仓#${r.tries}`,
+          stance: r.stance,
+          llmStance: r.llmStance,
+          llmConfidence: r.llmConfidence,
+          llmEventStatus: r.llmEventStatus,
+          bestAskAtSignal: r.bestAskAtSignal,
+          declarative: r.declarative,
+          dirMethod: r.dirMethod,
+          negRisk: r.negRisk,
+          feesEnabled: r.feesEnabled,
+          feeRate: r.feeRate,
+          forecastTemplate: r.forecastTemplate,
+          budgetMs: wallBudgetLeftMs(),
+        });
+        const at = new Date().toISOString();
+        console.log(
+          JSON.stringify({
+            mode: "chain-watch-refill",
+            at,
+            qid: r.qid.slice(0, 12),
+            token: tokenId.slice(0, 12),
+            try: r.tries,
+            status: attempt.status,
+            reason: attempt.reason,
+            usd: attempt.filledUsd ?? attempt.requestedUsd,
+            avgPrice: attempt.avgPrice,
+          })
+        );
+        appendTradeForensics({
+          mode: "chain-watch-refill",
+          at,
+          qid: r.qid,
+          token: tokenId,
+          question: r.question,
+          conditionId: r.conditionId,
+          eventId: r.eventId,
+          try: r.tries,
+          status: attempt.status,
+          reason: attempt.reason,
+          usd: attempt.filledUsd ?? attempt.requestedUsd,
+          avgPrice: attempt.avgPrice,
+          limitPrice: attempt.limitPrice,
+          freshAsk: attempt.freshAsk,
+          feeUsd: attempt.feeUsd,
+        });
+        // 该 token 敞口已打满 / 市场已无可成交盘口 → 没有再来一次的意义。
+        if (
+          attempt.status === "skipped" &&
+          /累计敞口已满|盘口无卖单|同事件聚合敞口已满|kill-switch|连亏/.test(attempt.reason ?? "")
+        ) {
+          delete queue[tokenId];
+        }
+      } catch (err) {
+        console.warn(
+          `[chain-watch] 补仓复访异常(${tokenId.slice(0, 10)}): ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+  };
+  await sweepRefillQueue();
 
   // ── I5 🔵收窄 + I2 洪水限流:即时邮件 vs 汇总队列 ──
   // 在自动下单之后路由(审计 2026-07-11 §9):真金动过手(成交/部分/错误/引擎级
@@ -1719,6 +2057,31 @@ async function main(): Promise<void> {
     } catch (err) {
       console.error(
         `[chain-watch] gap alert send failed (gap=${pending.gap},已暂存下 tick 重试): ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  };
+
+  /** 判读补判放弃的即时告警(2026-08-02)。只针对"已按 🟠 发过信、等绿档
+   * 升级"的事件 —— 放弃它等于放弃一次可能的实弹机会,躺在 6h 汇总里太晚。
+   * best-effort:发不出去不阻塞,digest 里仍有一份兜底。 */
+  const flushLlmGiveUpAlert = async (): Promise<void> => {
+    if (pendingLlmGiveUpAlerts.length === 0) return;
+    const items = pendingLlmGiveUpAlerts.splice(0, pendingLlmGiveUpAlerts.length);
+    try {
+      const rows = items
+        .map(
+          (i) =>
+            `<li style="font-size:13px">${escapeHtml(i.title ?? i.qid)} <span style="color:#888">(${i.attempts} 次尝试)</span></li>`
+        )
+        .join("");
+      await sendMail({
+        subject: `[PredEdge 链上] ⚠️ LLM 补判放弃 ${items.length} 个官方方向事件`,
+        html: `<div style="font-family:system-ui,sans-serif;max-width:640px"><p style="color:#d97706">⚠️ 以下事件已按 🟠 官方方向发过信,但 LLM 绿档复核在重试窗口内始终未完成 —— 绿档升级与自动执行都不会发生,请人工瞄一眼。</p><ul>${rows}</ul><p style="font-size:12px;color:#888">常见成因:判读线路中断(检查代理与 claude 登录)。2026-07-27/28 曾两次中断 17h/3h,期间 preArm 命中的家族全部拿到 unavailable。</p></div>`,
+        text: `LLM 补判放弃 ${items.length} 个官方方向事件:${items.map((i) => `${i.title ?? i.qid}(${i.attempts}次)`).join("; ")}`,
+      });
+    } catch (err) {
+      console.error(
+        `[chain-watch] LLM 放弃告警发送失败(digest 仍有兜底): ${err instanceof Error ? err.message : String(err)}`
       );
     }
   };
@@ -2123,6 +2486,7 @@ async function main(): Promise<void> {
     console.log(
       JSON.stringify({
         mode: "chain-watch-prearm",
+        at: new Date().toISOString(),
         polls,
         fired,
         batched: batchPending.size || undefined,
@@ -2135,9 +2499,16 @@ async function main(): Promise<void> {
     console.log(
       JSON.stringify({
         mode: "chain-watch",
+        // 2026-08-02 复盘:全文 9,163 行零时间戳,任何事后取证都得靠链上考古
+        // 反推(而公共 RPC 对 6 天前的 getLogs 已普遍拒绝)。每行 +30 字节。
+        at: new Date().toISOString(),
         from,
         to: sweptTo,
         events: logs.length,
+        // 事件按类型拆开:QuestionReset(争议重置)与 AncillaryDataUpdated
+        // (官方澄清)混在一个数字里,无法判断澄清供给是否衰减。
+        events_reset: resetEventCount || undefined,
+        events_context: contextEventCount || undefined,
         non_official_dropped: nonOfficialDropped || undefined,
         untrusted_creator: notable.filter((n) => n.untrustedCreator).length || undefined,
         notified,
@@ -2177,6 +2548,7 @@ async function main(): Promise<void> {
     }
     commitState();
     await flushGapAlert();
+    await flushLlmGiveUpAlert();
     await flushDigest();
     await flushPreArmMail();
     await reconcileTrades();
@@ -2287,6 +2659,7 @@ async function main(): Promise<void> {
   commitState();
   // 本 tick 的 gap 已随主邮件送达;这里只补送此前失败暂存的 gap 告警。
   await flushGapAlert();
+  await flushLlmGiveUpAlert();
   await flushDigest();
   await flushPreArmMail();
   await reconcileTrades();

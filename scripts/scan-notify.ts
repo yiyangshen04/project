@@ -25,6 +25,16 @@ import { takerFeePct } from "../lib/polymarket/scoring";
 import type { Opportunity, ScanResponse, ScanRun } from "../lib/types";
 import { renderOpportunitiesEmail, sendMail } from "./mailer";
 import { writeFileAtomic } from "../lib/fsAtomic";
+import { isDirectionalStance } from "../lib/virtualTags";
+
+/** 规则 a(无官方文本背书的纯争议腿)的价格地板。bt3:0.90-0.995 尾价 carry
+ * 档 n=107 胜率 100%/+3.1%,是有据的;0.55-0.90 的无方向争议腿零回测样本。
+ * 注意这不是全局价格窗 —— 带官方文本方向的机会走规则 c,不受此约束
+ * (肥尾的入场价恰在 0.16-0.50 低位)。 */
+const DISPUTED_NOTIFY_MIN_PRICE = Number(process.env.DISPUTED_NOTIFY_MIN_PRICE) || 0.9;
+
+/** 纯 decision 档位抖动的重发冷却(stance/via/confidence 未变时生效)。 */
+const NOTIFY_COOLDOWN_MS = Number(process.env.NOTIFY_COOLDOWN_MS) || 12 * 3600_000;
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const STATE_FILE = path.join(PROJECT_ROOT, "data", "notify-state.json");
@@ -74,8 +84,26 @@ function isNotifiable(o: Opportunity): boolean {
   // 最差的机会面——通知时买价普遍 >0.95、盈亏比 1:20+;3% 地板恰好留下判卷
   // 认可的 full lid 型有肉机会,挡掉 @0.972 型肉薄通知。带 via=text 官方文本
   // 的机会不受影响,照走规则 c。)
+  //
+  // 2026-08-02 复盘收窄:规则 a 原本完全不看方向、也没有价格天花板,成了
+  // stance=null / price_fallback / dispute_notice 三档共 21/28 条通知的万能
+  // 后门。实测后果:近 4 周 21 个市场里 7 个把正反两条腿都发了通知;还发出过
+  // net80.8%(入场价 ≈0.55,本质掷硬币)这种通知 —— 而这个 cohort 的 PnL 回测
+  // 样本量是 0。13 天 39 封邮件里唯一值钱的那封被埋在 38 封噪音里。
+  // 两条约束:
+  //   ① 代码自己列为"无方向"的 stance 不许走 actionable 通知(虚拟标签里
+  //      DIRECTIONLESS_STANCES 已明确,规则 a 却绕过了它);
+  //   ② 补一个价格地板:尾价 carry(bt3 里 0.90-0.995 档 n=107 胜率 100%)
+  //      是有据的;0.55-0.90 的无方向争议腿没有任何回测支撑,降级为观察。
+  //      带官方文本方向的机会不受此约束 —— 它们走规则 c(肥尾入场价恰在低位)。
   const uma = (o.umaResolutionStatus ?? "").trim().toLowerCase();
-  if (uma === "disputed" && o.decision === "actionable" && (o.netReturnPct ?? 0) >= 0.03) return true;
+  if (uma === "disputed" && o.decision === "actionable" && (o.netReturnPct ?? 0) >= 0.03) {
+    const stance = o.officialContext?.stance ?? null;
+    const directional = stance != null && isDirectionalStance(stance);
+    const tailCarry = o.price >= DISPUTED_NOTIFY_MIN_PRICE;
+    if (directional || tailCarry) return true;
+    return false;
+  }
   // c. 官方方向背书。仅限官方真实文本(via=text):price_fallback 是无文本时按
   // 价格推断的方向,官方并未背书,不配触发"官方方向"邮件(32/32 战绩只属于官方
   // 明确文本口径)。此处不再要求 decision!==rejected:一个官方已背书、但因盘口
@@ -149,7 +177,9 @@ const CONFIDENCE_RANK: Record<string, number> = { none: 0, low: 1, medium: 2, hi
 
 /**
  * 新 tokenId,或相对上次通知发生了值得重发的变化:
- * - decision 跨 actionable 边界(双向:进场/离场都值得知道);
+ * - decision 跨 actionable 边界(双向:进场/离场都值得知道),但 stance/via/
+ *   confidence 均未变的纯档位抖动受 NOTIFY_COOLDOWN_MS(默认 12h)冷却约束
+ *   —— 2026-08-02 复盘实测同一市场 8.6 天发出 11 封逐字相同的邮件;
  * - stance 字符串变化(双向:方向翻转是最重要的信号);
  * - via / confidence 仅在**升级**时触发(price_fallback→text、置信度上升)。
  *   降级多半是 RPC 瞬断导致官方文本暂时读不到(text→price_fallback 回落),
@@ -160,15 +190,25 @@ const CONFIDENCE_RANK: Record<string, number> = { none: 0, low: 1, medium: 2, hi
 function isNewOrChanged(state: NotifyState, o: Opportunity): boolean {
   const prev = state[o.tokenId];
   if (!prev) return true;
-  if (decisionTier(prev.lastDecision) !== decisionTier(o.decision)) return true;
-  if ((prev.lastStance ?? null) !== (o.officialContext?.stance ?? null)) return true;
-  if ("lastVia" in prev) {
-    const viaUpgraded =
-      o.officialContext?.via === "text" && prev.lastVia !== "text";
-    const confUpgraded =
-      (CONFIDENCE_RANK[o.officialContext?.confidence ?? "none"] ?? 0) >
-      (CONFIDENCE_RANK[prev.lastConfidence ?? "none"] ?? 0);
-    if (viaUpgraded || confUpgraded) return true;
+  // 实质变化(stance/via/confidence)优先判定,不受冷却约束 —— 官方文本升级
+  // 是最高价值的转换,任何时候都要立刻发。
+  const stanceChanged = (prev.lastStance ?? null) !== (o.officialContext?.stance ?? null);
+  const viaUpgraded = o.officialContext?.via === "text" && prev.lastVia !== "text";
+  const confUpgraded =
+    (CONFIDENCE_RANK[o.officialContext?.confidence ?? "none"] ?? 0) >
+    (CONFIDENCE_RANK[prev.lastConfidence ?? "none"] ?? 0);
+  if (stanceChanged) return true;
+  if ("lastVia" in prev && (viaUpgraded || confUpgraded)) return true;
+  // decision 档位翻转的冷却(2026-08-02 复盘):isNewOrChanged 只把
+  // rejected↔observe 折叠掉了,actionable↔rejected 的抖动照样触发重发 ——
+  // 而规则 c 放行 rejected,于是盘口深度/滑点在阈值附近来回摆的官方背书腿会
+  // 反复重发。实测:"Iran agrees to end enrichment" 8.6 天发了 11 封逐字相同
+  // 的邮件;"U.S. anti-cartel" 4 小时内 4 封。stance/via/confidence 都没变的
+  // 纯档位抖动,12h 内不再重发。
+  if (decisionTier(prev.lastDecision) !== decisionTier(o.decision)) {
+    const since = Date.parse(prev.notifiedAt ?? "");
+    if (!Number.isFinite(since) || Date.now() - since >= NOTIFY_COOLDOWN_MS) return true;
+    return false;
   }
   return false;
 }
@@ -233,6 +273,21 @@ async function main(): Promise<void> {
   // (disputeCoverage.complete=false)或订单簿抓取失败(booksIncomplete)意味着本
   // 轮机会集可能缺失真实候选——不能静默显示"扫描正常"。
   await handleCoverageDegradation(scan, state);
+
+  // 机会历史落库(2026-08-02 复盘):persistScanResult 一直只被 Web UI 路由
+  // 调用,cron 路径从未调用 —— 生产 sqlite 的 scan_runs/opportunities/
+  // odds_snapshots 三表至今 0 行,每轮 185~192 个机会打完日志就扔,导致既无法
+  // 做校准也无法回溯"错过了什么"。惰性 require + try/catch:保持 scan-notify
+  // "无 sqlite 也能跑"的既有承诺,落库失败绝不阻塞扫描与告警。
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const db = require("../lib/localDb") as typeof import("../lib/localDb");
+    db.persistScanResult(scan, opportunities);
+  } catch (err) {
+    console.warn(
+      `[scan-notify] 机会落库失败(不阻塞扫描): ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 
   // I6 后半:结算 chain-watch 自动登记的虚拟持仓(30 分钟节奏,有 Gamma)。
   await resolveOpenPaperTrades();

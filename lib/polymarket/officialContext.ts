@@ -203,9 +203,16 @@ export async function getOfficialUpdates(input: {
 
 // ── Stance classification ──
 
+/** 宣告类裁定(declarative):官方文本里出现 "will/should resolve to X" 这类
+ * 把答案直接印在脸上的措辞。历史兑现率 98.8%(vs 前瞻类 87%,见官方行为规律
+ * 研究 2026-07-14)。执行侧据此启用宣告扫单模式 —— 该子类里"少赚"的成本远
+ * 高于"多付几个价位"的成本,故只在此子类放宽限价帽,不做全局放宽。
+ * 当前三个 high 置信返回全部来自该分支,显式打标以防后续新增 high 路径时
+ * 语义悄悄漂移(闸门只准看这个布尔,不准按 confidence 反推)。 */
 export function stanceFromText(text: string | null | undefined): {
   stance: string;
   confidence: "high" | "medium" | "low" | "none";
+  declarative?: boolean;
 } {
   const lower = String(text ?? "").toLowerCase();
   if (!lower) return { stance: "none", confidence: "none" };
@@ -260,15 +267,15 @@ export function stanceFromText(text: string | null | undefined): {
     );
     if (folded) {
       return folded[1] === "yes"
-        ? { stance: "YES", confidence: "high" }
-        : { stance: "NO", confidence: "high" };
+        ? { stance: "YES", confidence: "high", declarative: true }
+        : { stance: "NO", confidence: "high", declarative: true };
     }
     const norm = outcome.replace(/\s+/g, "_");
     // A ruling names a short outcome label; a 5+ word capture is almost
     // always a narrative clause the widened verbs snagged ("officials
     // updated the underlying data…") — keep it out of the directional path.
     if (norm && outcome.split(/\s+/).length <= 4) {
-      return { stance: `resolve_to_${norm}`, confidence: "high" };
+      return { stance: `resolve_to_${norm}`, confidence: "high", declarative: true };
     }
     return { stance: "rule_context", confidence: "low" };
   }

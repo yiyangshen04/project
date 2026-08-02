@@ -73,7 +73,24 @@ export interface ExecCheck {
   executable: boolean;
   /** Simulated $100 market buy walking the asks (null when book too thin). */
   fill100: { avgPrice: number; worstPrice: number; shares: number; usd: number; fills: ExecFill[] } | null;
+  /** 尽力口径:走完限价内可得的 asks,不要求吃满 MIN_EXEC_USD(capped=true
+   * 表示深度不足 $100)。2026-08-02 复盘:paper 池上线至今 0 行,根因是登记
+   * 门槛挂在 fill100 上,而实测最厚一腿深度只有 ~$52 —— 连唯一那笔 +48% 的
+   * 真实成交都不够格登记,预告家族"paper 验证期"因此永远无法结束(死锁)。
+   * 回测的"真可执行"口径仍看 executable/fill100,不受本字段影响。 */
+  fillAvail: {
+    avgPrice: number;
+    worstPrice: number;
+    shares: number;
+    usd: number;
+    fills: ExecFill[];
+    capped: boolean;
+  } | null;
   endDate: string | null;
+  /** Gamma 事件 ID(同一事件下的兄弟腿共享)。用于执行侧的同事件聚合敞口帽:
+   * 一条澄清同时触发 N 个独立市场时,单笔/单日闸门约束不住"同一个判断压了
+   * N×maxOrder"(2026-07-28 飓风家族三腿共享 event 744619)。 */
+  eventId: string | null;
   closed: boolean;
   negRisk: boolean;
   feesEnabled: boolean | null;
@@ -310,6 +327,7 @@ export async function checkExecutability(input: {
     let bookEmpty = false;
     let askUsdNear = 0;
     let fill100: ExecCheck["fill100"] = null;
+    let fillAvail: ExecCheck["fillAvail"] = null;
 
     if (!market.closed && market.enableOrderBook !== false) {
       const book = await fetchJson<OrderBook>(`${CLOB_API}/book?token_id=${tokenId}`);
@@ -348,6 +366,18 @@ export async function checkExecutability(input: {
           cost += take * l.price;
           usdLeft -= take * l.price;
         }
+        // 尽力口径:同一次 walk 的结果,只是不要求走满 $100。深度不足时
+        // capped=true,登记侧据此分桶(薄簿样本不与足额样本混算均值)。
+        if (shares > 0) {
+          fillAvail = {
+            avgPrice: cost / shares,
+            worstPrice: fills[fills.length - 1].price,
+            shares,
+            usd: cost,
+            fills,
+            capped: cost < MIN_EXEC_USD - 0.01,
+          };
+        }
         if (cost >= MIN_EXEC_USD - 0.01 && shares > 0) {
           fill100 = {
             avgPrice: cost / shares,
@@ -377,7 +407,9 @@ export async function checkExecutability(input: {
       askUsdNear: Math.round(askUsdNear * 100) / 100,
       executable: askUsdNear >= MIN_EXEC_USD,
       fill100,
+      fillAvail,
       endDate: market.endDate ?? null,
+      eventId: market.events?.[0]?.id ?? null,
       closed: market.closed === true,
       negRisk: market.negRisk === true,
       feesEnabled: market.feesEnabled ?? null,

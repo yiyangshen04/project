@@ -44,8 +44,12 @@ export const KNOWN_ADAPTERS = [
 ];
 
 const WINDOW_BLOCKS = 100; // free-tier getLogs cap (drpc ~101, measured)
-const MAX_LOOKBACK_BLOCKS = 129_600; // ~3 days of Polygon blocks (~2s each)
-const DEFAULT_LOOKBACK_BLOCKS = 43_200; // first run / lost cursor: ~1 day
+// Polygon block time measured 1.5000 s/block (5 independent samples spanning
+// 2026-06→08; the earlier ~2s figure predates the switch). The old constants
+// therefore covered only 2.25 days / 18 h — a 25% short lookback that silently
+// truncated catch-up after any outage longer than that.
+const MAX_LOOKBACK_BLOCKS = 172_800; // ~3 days of Polygon blocks (~1.5s each, measured 2026-08)
+const DEFAULT_LOOKBACK_BLOCKS = 57_600; // first run / lost cursor: ~1 day
 const SWEEP_CONCURRENCY = 4;
 const KV_CURSOR_KEY = "onchain_events_last_block";
 // Scan/advance only to a confirmed depth. A getLogs window served by a lagging

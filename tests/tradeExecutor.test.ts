@@ -17,6 +17,7 @@ import {
   lossHaltTripped,
   settledFinal,
   takerFeeUsd,
+  limitPriceFor,
 } from "../lib/polymarket/tradeExecutor";
 
 test("filled/partial 按 filledUsd 计,而非 requestedUsd", () => {
@@ -183,7 +184,7 @@ test("lossHaltTripped:尾亏达阈值触发;水位之后无新亏损不重复熔
 // 闸门全部在任何网络调用之前,可离线断言;EXEC_WALLET_JSON 指向不存在路径,
 // 保证"过闸"用例在 client init 处以 error 终止,绝不触网。
 import { executeSignal } from "../lib/polymarket/tradeExecutor";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -313,4 +314,101 @@ test("无基准 skip:bookEmpty 缺省/false → 注解异常口径(请求人工�
   assert.equal(r.subjectAlert, "无盘口基准");
   const explicit = await execWith({}, { bestAskAtSignal: null, bookEmpty: false, forecastTemplate: false });
   assert.match(explicit.reason ?? "", /无盘口基准/);
+});
+
+// ── 2026-08-02 复盘批:补仓额度 / 同事件聚合帽 / 宣告扫单限价 ──
+
+test("限价帽:普通 🟢 用绝对滑点带,宣告类按边缩放放宽", () => {
+  const cfg = { slippage: 0.03, slippageEdgeFrac: 0.15, maxPrice: 0.97 };
+  // 0.66:普通 = 0.66+0.03 = 0.69;宣告 = 0.66 + max(0.03, 0.15×0.34=0.051) = 0.711 → 0.71
+  assert.equal(limitPriceFor(0.66, false, cfg), 0.69);
+  assert.equal(limitPriceFor(0.66, true, cfg), 0.71);
+  // 高价位:边缩放退化回绝对带,两者一致(只放宽低价位,绝不收紧既有行为)
+  assert.equal(limitPriceFor(0.9, false, cfg), 0.93);
+  assert.equal(limitPriceFor(0.9, true, cfg), 0.93);
+  // maxPrice 与 0.99 硬帽在两种口径下都不被突破
+  assert.equal(limitPriceFor(0.96, true, cfg), 0.97);
+  // 0.5 + max(0.03, 0.15×0.5=0.075) = 0.575,但 0.575×100 在双精度下是
+  // 57.4999…,Math.round 落到 57 → 0.57。这是既有 round(x*100)/100 惯用法的
+  // 浮点边界,方向是"少付一个 tick"(保守),刻意不改:改成向上取整会在所有
+  // 现存路径上普涨限价。
+  assert.equal(limitPriceFor(0.5, true, { ...cfg, maxPrice: 0.99 }), 0.57);
+});
+
+test("补仓:token 累计敞口未达上限 → 不再二值封锁(可继续加仓)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "prededge-refill-"));
+  const ledger = join(dir, "ledger.jsonl");
+  // 已成交 $47(与 2026-07-28 实盘同形态),per-token 上限 $100 → 还剩 $53
+  writeFileSync(
+    ledger,
+    JSON.stringify({
+      at: "2026-07-28T21:21:53.718Z", qid: "q1", tokenId: "tok-1", conditionId: "c1",
+      mode: "live", status: "filled", posted: true, requestedUsd: 47, filledUsd: 47,
+    }) + "\n"
+  );
+  const r = await execWith(
+    { EXEC_LEDGER: ledger, EXEC_PER_TOKEN_MAX_USD: "100", EXEC_MAX_ORDER_USD: "100" },
+    { tokenId: "tok-1", conditionId: "c1", forecastTemplate: false }
+  );
+  // 过了去重闸(否则会是 skipped/累计敞口已满);此处按缺钱包 error 终止
+  assert.notEqual(r.status, "skipped");
+  assert.doesNotMatch(r.reason ?? "", /累计敞口已满|已对该 token 执行过/);
+});
+
+test("补仓:token 累计敞口达上限 → skip 并说明是敞口口径(不是旧的二值封锁)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "prededge-refill2-"));
+  const ledger = join(dir, "ledger.jsonl");
+  writeFileSync(
+    ledger,
+    JSON.stringify({
+      at: "2026-07-28T21:21:53.718Z", qid: "q1", tokenId: "tok-1", conditionId: "c1",
+      mode: "live", status: "filled", posted: true, requestedUsd: 47, filledUsd: 47,
+    }) + "\n"
+  );
+  const r = await execWith(
+    { EXEC_LEDGER: ledger, EXEC_PER_TOKEN_MAX_USD: "40" },
+    { tokenId: "tok-1", conditionId: "c1", forecastTemplate: false }
+  );
+  assert.equal(r.status, "skipped");
+  assert.match(r.reason ?? "", /累计敞口已满/);
+});
+
+test("同事件聚合帽:兄弟腿共享 eventId,合计触顶即拦(单笔/单日闸拦不住的口径)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "prededge-event-"));
+  const ledger = join(dir, "ledger.jsonl");
+  // 同一事件下两条已成交的兄弟腿,合计 $150
+  writeFileSync(
+    ledger,
+    [
+      JSON.stringify({ at: "2026-07-28T21:00:00.000Z", qid: "qa", tokenId: "tok-a", conditionId: "ca", eventId: "744619", mode: "live", status: "filled", posted: true, filledUsd: 80 }),
+      JSON.stringify({ at: "2026-07-28T21:05:00.000Z", qid: "qb", tokenId: "tok-b", conditionId: "cb", eventId: "744619", mode: "live", status: "filled", posted: true, filledUsd: 70 }),
+    ].join("\n") + "\n"
+  );
+  const r = await execWith(
+    { EXEC_LEDGER: ledger, EXEC_PER_EVENT_MAX_USD: "150", EXEC_DAILY_MAX_USD: "1000", EXEC_TOTAL_MAX_USD: "5000" },
+    { tokenId: "tok-c", conditionId: "cc", eventId: "744619", forecastTemplate: false }
+  );
+  assert.equal(r.status, "skipped");
+  assert.match(r.reason ?? "", /同事件聚合敞口已满/);
+  assert.equal(r.subjectAlert, "同事件敞口满");
+  // 不同事件的腿不受此闸约束
+  const other = await execWith(
+    { EXEC_LEDGER: ledger, EXEC_PER_EVENT_MAX_USD: "150", EXEC_DAILY_MAX_USD: "1000", EXEC_TOTAL_MAX_USD: "5000" },
+    { tokenId: "tok-d", conditionId: "cd", eventId: "999999", forecastTemplate: false }
+  );
+  assert.doesNotMatch(other.reason ?? "", /同事件聚合敞口已满/);
+});
+
+test("eventId 缺失时同事件帽不生效(不阻断没有事件归属的信号)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "prededge-event2-"));
+  const ledger = join(dir, "ledger.jsonl");
+  writeFileSync(
+    ledger,
+    JSON.stringify({ at: "2026-07-28T21:00:00.000Z", qid: "qa", tokenId: "tok-a", conditionId: "ca", eventId: "744619", mode: "live", status: "filled", posted: true, filledUsd: 300 }) + "\n"
+  );
+  const r = await execWith(
+    { EXEC_LEDGER: ledger, EXEC_PER_EVENT_MAX_USD: "150", EXEC_DAILY_MAX_USD: "1000", EXEC_TOTAL_MAX_USD: "5000" },
+    { tokenId: "tok-z", conditionId: "cz", forecastTemplate: false }
+  );
+  assert.doesNotMatch(r.reason ?? "", /同事件聚合敞口已满/);
 });
