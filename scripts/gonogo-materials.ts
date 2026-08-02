@@ -23,10 +23,14 @@
  *         后这一层才有输入。不要用"现在能拿到的残缺数据"硬凑一个层 2,那会
  *         给出一个看起来有统计量、实际不可信的结论。
  *
- * 用法:
- *   npx tsx scripts/gonogo-materials.ts                 # 人读报告
- *   npx tsx scripts/gonogo-materials.ts --json          # 机读
- *   npx tsx scripts/gonogo-materials.ts --usd 50        # 反事实按每笔 $50 计
+ * 用法。注意:在 sufe 上必须经 run-cron.sh —— 它会 source .env 带上代理,
+ * 直接 npx tsx 跑的话 Gamma/data-api 在国内直连不可达,全部条目会显示
+ * "不可定价"(实测踩过一次,结果看起来像"没数据",其实是没代理)。
+ *   ./run-cron.sh scripts/gonogo-materials.ts           # 生产机(带代理)
+ *   npx tsx scripts/gonogo-materials.ts                 # 本机(能直连时)
+ *   ./run-cron.sh scripts/gonogo-materials.ts --json    # 机读
+ *   ./run-cron.sh scripts/gonogo-materials.ts --usd 50  # 反事实按每笔 $50 计
+ *   npx tsx scripts/gonogo-materials.ts --dir <拉下来的 data 目录>
  *
  * 只读:不下单、不改任何状态文件。
  */
