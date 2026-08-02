@@ -365,9 +365,21 @@ test("补仓:token 累计敞口达上限 → skip 并说明是敞口口径(不�
       mode: "live", status: "filled", posted: true, requestedUsd: 47, filledUsd: 47,
     }) + "\n"
   );
+  // 零网络的真正理由(2026-08-02 三轮复查:只改注释,断言与参数值一律不动)。
+  // 旧注释写的是"budgetMs=14s 让 openExposureUsd 首轮 break",第二轮把 per-token 帽上
+  // 那一跳 Gamma 撤掉之后就不成立了:该闸现在是纯本地缓存读(tradeExecutor.ts:924
+  // loadSettledCache,单次小文件,无网络),且本用例命中的 return(:957 finish skipped)
+  // 位于 totalMax 那个块(:1002-1031)**之前** —— openExposureUsd 在这条路径上根本不可达,
+  // 零网络与 budgetMs 无关。
+  // budgetMs=14_000 仍保留,作用是纵深钉住另一条路径:万一日后调闸门顺序/阈值让流程走到
+  // totalMax 那块,其探测预算 = min(12s, budgetMs−15s) ≤ 0,openExposureUsd 首轮即 break
+  // (:522 deadline 判断),套件"闸门断言绝不触网"的前提照样成立。
+  // 两个坑别踩:① 别按旧注释推断 per-token 会打网络;② 别因为"看着没用"删掉这个参数。
+  // 下界也是硬的:14_000 不能降到 12_000 以下,否则被 :789 的"tick 预算不足"前置闸提前
+  // 拦掉,本用例断的就不再是敞口闸了。
   const r = await execWith(
     { EXEC_LEDGER: ledger, EXEC_PER_TOKEN_MAX_USD: "40" },
-    { tokenId: "tok-1", conditionId: "c1", forecastTemplate: false }
+    { tokenId: "tok-1", conditionId: "c1", forecastTemplate: false, budgetMs: 14_000 }
   );
   assert.equal(r.status, "skipped");
   assert.match(r.reason ?? "", /累计敞口已满/);
@@ -397,6 +409,124 @@ test("同事件聚合帽:兄弟腿共享 eventId,合计触顶即拦(单笔/单�
     { tokenId: "tok-d", conditionId: "cd", eventId: "999999", forecastTemplate: false }
   );
   assert.doesNotMatch(other.reason ?? "", /同事件聚合敞口已满/);
+});
+
+// ── 2026-08-02 xhigh 审计:finding 9(per-token 结算核销)/ finding 13(dry 封锁)──
+
+test("finding 9:per-token 帽做结算核销 —— 毛额触顶但已结算 → 放行(不再终身封死)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "prededge-pertoken-settled-"));
+  const ledger = join(dir, "ledger.jsonl");
+  // 该 token 终身毛额 $100 = per-token 上限:修复前 exposedUsd 单调不减,
+  // 一次吃满就永久 skip(与刚被替换掉的二值封锁等价)。
+  writeFileSync(
+    ledger,
+    JSON.stringify({
+      at: "2026-07-28T21:21:53.718Z", qid: "q1", tokenId: "tok-1", conditionId: "c1",
+      mode: "live", status: "filled", posted: true, requestedUsd: 100, filledUsd: 100,
+    }) + "\n"
+  );
+  // 结算缓存 = openExposureUsd 内部同一份文件(ledger 同目录 trade-settled.json)。
+  // c1 已终局(带 pnl)→ 钱早已回款,净敞口 $0,零网络即可核销。
+  writeFileSync(
+    join(dir, "trade-settled.json"),
+    JSON.stringify({ c1: { at: "2026-07-30T00:00:00.000Z", pnlUsd: 12, notified: true } })
+  );
+  const r = await execWith(
+    {
+      EXEC_LEDGER: ledger, EXEC_PER_TOKEN_MAX_USD: "100", EXEC_MAX_ORDER_USD: "100",
+      EXEC_DAILY_MAX_USD: "1000", EXEC_TOTAL_MAX_USD: "5000",
+    },
+    { tokenId: "tok-1", conditionId: "c1", forecastTemplate: false }
+  );
+  // 过闸(此处按缺钱包 error 终止);修复前是 skipped「累计敞口已满」
+  assert.notEqual(r.status, "skipped");
+  assert.doesNotMatch(r.reason ?? "", /累计敞口已满/);
+});
+
+test("finding 9:核销只放宽不放大 —— 未结算的同额敞口仍触顶,文案带净/毛双口径", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "prededge-pertoken-open-"));
+  const ledger = join(dir, "ledger.jsonl");
+  writeFileSync(
+    ledger,
+    JSON.stringify({
+      at: "2026-07-28T21:21:53.718Z", qid: "q1", tokenId: "tok-1", conditionId: "c1",
+      mode: "live", status: "filled", posted: true, requestedUsd: 100, filledUsd: 100,
+    }) + "\n"
+  );
+  // trade-settled.json 不存在 = 该持仓仍在险中,缓存未知按 fail-closed 计,故净=毛。
+  // 零网络同上一用例(2026-08-02 三轮复查:只改注释,断言与参数值一律不动):per-token 帽
+  // 第二轮起是纯缓存读,且这条 skip 的 return 在 totalMax 块之前,openExposureUsd 不可达;
+  // budgetMs=14_000 保留为纵深(让 totalMax 那条路径的探测预算 ≤0 同样不触网),且必须
+  // ≥12_000 以免被 tradeExecutor.ts:789 的"tick 预算不足"前置闸抢先拦下。
+  const r = await execWith(
+    {
+      EXEC_LEDGER: ledger, EXEC_PER_TOKEN_MAX_USD: "100", EXEC_MAX_ORDER_USD: "100",
+      EXEC_DAILY_MAX_USD: "1000", EXEC_TOTAL_MAX_USD: "5000",
+    },
+    { tokenId: "tok-1", conditionId: "c1", forecastTemplate: false, budgetMs: 14_000 }
+  );
+  assert.equal(r.status, "skipped");
+  assert.match(r.reason ?? "", /累计敞口已满/); // gonogo bucketOf 按此词干归"额度闸"
+  assert.match(r.reason ?? "", /净 \$100\/100/);
+  assert.match(r.reason ?? "", /毛额 \$100/);
+});
+
+test("finding 13:dry 模式被已有实盘敞口封锁(不重复构单)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "prededge-drydup-"));
+  const ledger = join(dir, "ledger.jsonl");
+  // 实盘已持 $20(远低于 per-token 上限,live 侧本可继续补仓)
+  writeFileSync(
+    ledger,
+    JSON.stringify({
+      at: "2026-07-28T21:21:53.718Z", qid: "q1", tokenId: "tok-1", conditionId: "c1",
+      mode: "live", status: "filled", posted: true, requestedUsd: 20, filledUsd: 20,
+    }) + "\n"
+  );
+  const r = await execWith(
+    { EXEC_MODE: "dry", EXEC_LEDGER: ledger, EXEC_PER_TOKEN_MAX_USD: "100", EXEC_MAX_ORDER_USD: "100" },
+    { tokenId: "tok-1", conditionId: "c1", forecastTemplate: false }
+  );
+  // 修复前 dry 分支只匹配旧 dry 行,live 持仓对 dry 不可见 → 照常构单并发
+  // "已构单"的 dry 邮件,读信人看不到「已有持仓」这个关键上下文。
+  assert.equal(r.status, "skipped");
+  assert.match(r.reason ?? "", /已有实盘敞口/);
+  assert.equal(r.subjectAlert, "已持仓$20");
+});
+
+test("finding 13 边界:旧 dry 行仍走原文案;零敞口的 live 行不封锁 dry", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "prededge-drydup2-"));
+  // (a) 只有旧 dry 行 → 原「已对该 token 执行过」语义不变
+  const dryLedger = join(dir, "dry.jsonl");
+  writeFileSync(
+    dryLedger,
+    JSON.stringify({
+      at: "2026-07-28T21:00:00.000Z", qid: "q1", tokenId: "tok-1", conditionId: "c1",
+      mode: "dry", status: "dry", posted: false, requestedUsd: 20,
+    }) + "\n"
+  );
+  const a = await execWith(
+    { EXEC_MODE: "dry", EXEC_LEDGER: dryLedger },
+    { tokenId: "tok-1", conditionId: "c1", forecastTemplate: false }
+  );
+  assert.equal(a.status, "skipped");
+  assert.match(a.reason ?? "", /已对该 token 执行过/);
+  assert.doesNotMatch(a.reason ?? "", /已有实盘敞口/);
+  // (b) live 行零成交(posted=true 但无 filledUsd,exposedUsd=0)→ 不封锁:
+  // 一次 FAK 无对手盘不该让 dry 演练路径对该 token 失明。
+  const noFillLedger = join(dir, "nofill.jsonl");
+  writeFileSync(
+    noFillLedger,
+    JSON.stringify({
+      at: "2026-07-28T21:00:00.000Z", qid: "q1", tokenId: "tok-1", conditionId: "c1",
+      mode: "live", status: "none", posted: true, requestedUsd: 50,
+    }) + "\n"
+  );
+  const b = await execWith(
+    { EXEC_MODE: "dry", EXEC_LEDGER: noFillLedger },
+    { tokenId: "tok-1", conditionId: "c1", forecastTemplate: false }
+  );
+  assert.notEqual(b.status, "skipped");
+  assert.doesNotMatch(b.reason ?? "", /已有实盘敞口|已对该 token 执行过/);
 });
 
 test("eventId 缺失时同事件帽不生效(不阻断没有事件归属的信号)", async () => {

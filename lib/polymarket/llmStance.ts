@@ -23,8 +23,13 @@
  *
  * Failure semantics: every failure mode (CLI missing, not logged in, timeout,
  * unparseable output) returns null so callers fall back to the regex-only
- * gate. A failure inside one process disables further NEW CLI calls for that
- * process (one cron tick); cache hits are still served. Per-EVENT retry is
+ * gate. 什么时候把整个进程(=一个 cron tick)的判读关掉,是有分级的
+ * (2026-08-02 复查 R10):终局故障(未登录/CLI 缺失/参数不被接受)第一次就关;
+ * 瞬断(超时/代理半开/5xx)必须**两个不同事件**都重试耗尽才关,单个病态
+ * prompt 无权掐掉全 tick 的 🟢 双确认档 —— 见 LLM_DISABLE_AFTER_FAILED_KEYS。
+ * 第三条闸是墙钟而非次数(2026-08-02 三轮复查 N1):不论几个事件作证,瞬断
+ * 一共只能烧掉一份 timeoutMs,触顶即停判读 —— 见 LLM_TRANSIENT_BURN_SHARES。
+ * 关闸后 cache hits 仍照常服务。Per-EVENT retry is
  * NOT this module's job — a null verdict here permanently gates the event
  * unless the caller re-consults, which chain-watch does via its persisted
  * llmPending queue.
@@ -34,6 +39,13 @@
  * LLM_STANCE_TIMEOUT_MS (default 60s), LLM_STANCE_CACHE (default
  * data/llm-stance-cache.json). Auth: CLAUDE_CODE_OAUTH_TOKEN in .env
  * (from `claude setup-token`) or an interactive login on the box.
+ * 重试与代理旋钮(2026-08-02 审计补齐说明):LLM_STANCE_MAX_TRIES(默认 3,
+ * 瞬断重试次数)、LLM_STANCE_RETRY_BACKOFF_MS(默认 1500,两次尝试之间的退避)
+ * —— 注意 LLM_STANCE_TIMEOUT_MS 是整轮总预算,单次尝试的超时按 maxTries 均分
+ * 并以 LLM_MIN_ATTEMPT_MS 托底,两者不再共用同一个数;LLM_PROXY_FALLBACK
+ * (备用代理 URL)、LLM_PROXY_ALLOW_DIRECT=on(直连兜底,sufe 上直连必 403 故
+ * 默认关)。后两个键生产 .env 里都没有配,重试只能原线路重来 —— 真发生重试
+ * 时失败告警会点名说破,见 noProxyFallbackNote。
  */
 import { execFile } from "child_process";
 import { readFileSync } from "fs";
@@ -81,6 +93,38 @@ const UPDATES_TOTAL_MAX_CHARS = 12_000;
  * 模板盘冲掉。纯本地 JSON,3000 条约 1.2MB,体积可忽略。 */
 const CACHE_MAX_ENTRIES = 3_000;
 
+/** 单次尝试的超时下限(2026-08-02 审计 finding 5)。原实现把"单次调用超时"
+ * 与"整轮重试预算"写成同一个数(生产 LLM_STANCE_TIMEOUT_MS=60s):第一次尝试
+ * 若以超时告终 —— 代理半开挂死,正是这套重试所针对的主形态 —— 就把 deadline
+ * 一次用光,下一轮循环开头 leftMs≈0 直接 break,maxTries=3 实际只跑 1 次,
+ * 日志却仍打 "after 3 tries" 误导排障。解耦后单次超时 = 总预算/maxTries,并由
+ * 本常量托底。取 20s 的依据(2026-08-02 在生产机经 run-cron.sh 的两组实测):
+ *  · 串行 3 次:8110 / 9336 / 4709 ms(典型 ~5-9s);
+ *  · 并发 3 次/轮共两轮 6 次(LLM_STANCE_CONCURRENCY=3,与生产默认值一致):
+ *    7842 / 8517 / 8338 / 7291 / 7711 / 9730 ms,最慢 9730ms。
+ * 即并发档与串行几乎无差(瓶颈在对端而非本机 CPU/代理并发),20s ≈ 实测
+ * 最慢一次的两倍余量 —— 既不会误杀健康调用,又能在 60s 预算内留出三次尝试。
+ * 2026-08-02 复查据此确认地板值保留 20_000 不变;真正被复查改掉的是超时的
+ * 爆炸半径,见 LLM_DISABLE_AFTER_FAILED_KEYS。 */
+export const LLM_MIN_ATTEMPT_MS = 20_000;
+
+/** 重试地板:整轮剩余预算低于此值就不再发起新尝试(发出去也是必被 deadline
+ * 腰斩的空转)。与 perAttemptTimeoutMs 成对出现 —— "切分够不够留下一次重试"
+ * 这个性质等价于 timeoutMs − perAttempt ≥ 本值。 */
+export const LLM_RETRY_MIN_LEFT_MS = 5_000;
+
+/** 单次尝试超时 = 总预算按 maxTries 均分、以 LLM_MIN_ATTEMPT_MS 托底、再夹回
+ * 总预算(2026-08-02 审计 finding 5)。抽成独立纯函数只为可离线断言,取值与
+ * 内联版本逐字一致。三段语义:
+ *  · 60s/3 → 20s:一次打满超时的失败之后仍剩 40s,重试真的会发生(修复前
+ *    perAttempt === 总预算,leftMs=0 直接 break,maxTries=3 实跑 1 次);
+ *  · 45s/3 → 20s(下限托底):不切出比实测典型调用(5-9s)还紧的无效片;
+ *  · 15s/3 → 15s(夹回预算):调用方 wallBudget 压小时自然退化为单次尝试。 */
+export function perAttemptTimeoutMs(totalBudgetMs: number, maxTries: number): number {
+  const tries = Math.max(1, maxTries);
+  return Math.min(totalBudgetMs, Math.max(LLM_MIN_ATTEMPT_MS, Math.floor(totalBudgetMs / tries)));
+}
+
 /** Replaces Claude Code's default (coding-agent) system prompt — that prompt
  * plus ~/.claude/CLAUDE.md user memory is pure noise for a classification
  * call. States the project context, the cost model of each error direction,
@@ -105,10 +149,126 @@ Three further documented failure patterns, from a study of every historical judg
  * 语境漏报远比误报便宜)。 */
 const PROMPT_VERSION = 5;
 
-/** Once a call fails within this process, skip further calls for the rest of
- * the tick — an unauthenticated/missing CLI would otherwise burn the timeout
- * once per event. Cron gives us a fresh process (and thus a retry) every tick. */
+/** Once the LLM line is judged dead within this process, skip further calls for
+ * the rest of the tick — an unauthenticated/missing CLI would otherwise burn the
+ * timeout once per event. Cron gives us a fresh process (and thus a retry) every
+ * tick. 判死的两条路径分级见 isTerminalLlmFailure(终局,第一次就关)与
+ * LLM_DISABLE_AFTER_FAILED_KEYS(瞬断,要两个不同事件)。 */
 let disabledThisProcess = false;
+
+/** 关闭整个 tick 判读所需的"不同事件"数(2026-08-02 复查 R10)。
+ * 缺陷形态:第一轮把"任意一次调用重试耗尽"直接写成 disabledThisProcess=true,
+ * 于是一个病态 prompt 就能掐掉整个 tick 的判读 —— 本 tick 剩余所有事件一律
+ * 返回 null,🟢 双确认档连同挂在它上面的自动下单闸门整体消失,而邮件表面
+ * 一切正常(只有 llm:"unavailable" 一处能看出来)。这个权力不该给单个盘:
+ * prompt 体量跨度极大(UPDATES_TOTAL_MAX_CHARS=12_000,官方文本堆满的大盘
+ * 完全可能把 20s 单次超时连打三次),三次超时只证明"这个 prompt 太重",
+ * 不足以证明线路已死;**两个不同事件**都重试耗尽才是线路级证据 ——
+ * 2026-07-27/28 两次真断供(17h + 3h)正是这个形态,所有事件无差别失败,
+ * 第二个事件立刻就能凑够。取 2 而不取更大:每多要一个事件作证,真断供时就
+ * 多空转一整份 timeoutMs(虽然仍受调用方 wallBudget 硬钳,但会挤掉其他事件
+ * 的判读预算 → 它们退到 llmPending 下轮补判)。
+ * 终局故障不走这个计数:未登录/CLI 缺失/参数不被接受,重试确实毫无意义,
+ * 维持第一次就立刻关闭的既有语义。 */
+const LLM_DISABLE_AFTER_FAILED_KEYS = 2;
+
+/** 本进程内"重试耗尽"过的 cacheKey 去重集合。去重是必须的:同一事件被
+ * llmPending 补判/复判重来若各算一次,阈值会被单个病态事件自己凑满,等于
+ * 退化回"一个 prompt 掐全 tick"。
+ * 并发无竞态(LLM_STANCE_CONCURRENCY 生产默认 3):Node 是单线程事件循环,
+ * add 与 size 读都发生在 await 返回之后的同一个同步块里,中途不可能被另一个
+ * worker 插入执行,因此不存在读改写交错。并发唯一的可观察效应是关闸瞬间可能
+ * 还有 ≤ width−1 个调用在飞 —— 它们各自跑完自己那份预算即止,总耗时仍被
+ * 调用方的 wallBudget 钳住,不会超烧。
+ * 规模上界:关闸后不再发起新调用,集合最多 N + width 条,无需清理。 */
+const exhaustedKeys = new Set<string>();
+
+/** 瞬断墙钟硬帽,以 envTimeoutMs 的份数计(2026-08-02 三轮复查 N1)。
+ *
+ * 为什么需要第三条闸:LLM_DISABLE_AFTER_FAILED_KEYS 只回答"线路算不算死",
+ * 不回答"证明它死可以烧掉多少 tick 预算"。把门槛从 1 提到 2 是对的(一个
+ * 病态 prompt 不该掐掉整个 tick),但副作用是把瞬断期间烧掉的墙钟翻倍:
+ *  · 单个事件重试耗尽 ≈ 一整份 timeoutMs —— 3 × perAttempt(20s,见
+ *    LLM_MIN_ATTEMPT_MS/perAttemptTimeoutMs)+ 退避,恰好把 60s 预算用满;
+ *  · 门槛 2 ⇒ 瞬断时烧 120s,而一个 tick 的墙钟预算只有 158s
+ *    (scripts/chain-watch.ts:TICK_KILL_MS 170_000 − SEND_MARGIN_MS 12_000);
+ *  · llmPending 补判循环是**串行**的,其早停守卫 llmBudgetLeftMs() <
+ *    LLM_MIN_CALL_MS(15s)比这个量级小一个数量级,拦不住。
+ * 烧掉 120s 后只剩 ~38s,下游被逐条击穿:
+ *  · sweepRefillQueue 的 wallBudgetLeftMs() < 45_000 立即 break →
+ *    本批的头号功能"12 分钟补仓窗口"在整个断供期间每个 tick 都不跑;
+ *  · reconcileSettlements 的 < 25_000 同样跳过;
+ *  · 繁忙 tick 里 maybeExecuteTrade 拿到的 budgetMs 可跌破 12_000,真 🟢 信号
+ *    被记成"tick 预算不足" skip。
+ * 触发条件是常态而非边缘:isTerminalLlmFailure 只认 401/unauthorized/ENOENT 等,
+ * **403 与超时都算瞬断**;而 llmPending ≥2 条从断供第二个 tick 起就是常态 ——
+ * 2026-07-27/28 两次真断供(17h + 3h)正是这个形态。
+ *
+ * 为什么是 1 份而不是 2 份:158 − 60 = 98s,仍稳稳高于 sweepRefillQueue 的 45s
+ * 门限(补仓照跑),还留得下 reconcile 的 25s 与下单;取 2 份就是 158 − 120 =
+ * 38s,正是上面那条击穿路径。即"最坏情况退回门槛 1 之前的耗时口径",但保留
+ * 门槛 2 的判死语义。
+ *
+ * 两条闸的分工(互不替代):失败快(连接秒拒、CLI 立刻退出)时几乎不烧墙钟,
+ * 帽子不响、由门槛 2 认定线路死;失败慢(代理半开挂死到超时)时帽子先响,
+ * 一份预算烧完就停,不等第二个事件作证。
+ *
+ * 2026-08-02 三轮复查实测(生产常量 60s/3 次/1.5s 退避,挂死型假 CLI,5 个
+ * llmPending):事件 #1 烧 60,003ms(20s+1.5s+20s+1.5s+17s,3 次 CLI),
+ * 事件 #2-#5 各 0ms/0 次 CLI —— 158,000ms 的 tick 墙钟剩 97,994ms,三条下游
+ * 门限(45,000 / 25,000 / 12,000)全部越过,最紧的一条仍余 52,994ms 给
+ * 本 tick 其余工作。取 2 份则剩 37,994ms,sweepRefillQueue 必被击穿。 */
+export const LLM_TRANSIENT_BURN_SHARES = 1;
+
+/** 硬帽判据,抽成纯函数只为可离线断言(同 perAttemptTimeoutMs 的理由),
+ * 取值与调用点逐字一致。返回本次调用还允许烧掉的墙钟 allowanceMs —— 它同时
+ * 是 timeoutMs 的夹取上界,这一夹取把"总烧 ≤ 一份预算"变成闭合保证:单次调用
+ * 的 burnedMs 受自己的 deadline 约束 ≤ allowanceMs,而 allowanceMs = 帽 − 账本,
+ * 故账本恒 ≤ 帽。
+ * `ledgerMs > 0` 这半个条件是防误配自锁:若有人把 LLM_STANCE_TIMEOUT_MS 配到
+ * < LLM_MIN_ATTEMPT_MS(帽随之也小于一次最小尝试),没有它就会在一次瞬断都还
+ * 没发生时把本 tick 的判读全关掉。只有真烧过墙钟才允许这道闸生效。
+ * 余量门槛取 LLM_MIN_ATTEMPT_MS 而非 0,同 LLM_RETRY_MIN_LEFT_MS 的道理:拿不到
+ * 一次最小尝试的预算,发出去也只是必被 deadline 腰斩的空转。 */
+export function llmBurnGate(
+  ledgerMs: number,
+  capMs: number
+): { blocked: boolean; allowanceMs: number } {
+  const allowanceMs = capMs - ledgerMs;
+  return { blocked: ledgerMs > 0 && allowanceMs < LLM_MIN_ATTEMPT_MS, allowanceMs };
+}
+
+/** 本 tick 已被瞬断失败烧掉的墙钟(ms)。只累加**失败尝试**及其后退避睡眠真正
+ * 占用的时间:成功那次尝试的耗时是判读的对价、不是浪费,不计入。
+ * 一进程 = 一 tick —— run-cron.sh 每个 tick 用 $TSX_BIN 起一个新进程并配
+ * RUN_TIMEOUT=170(复查已确认),模块级变量随进程消亡,因此这个账本天然按
+ * tick 归零,生产路径不需要、也没有任何显式重置点。
+ * 触顶告警只打一次(burnCapWarned):这行是"本 tick 判读已停"的状态迁移,
+ * 不是每个被跳过的事件都要复读的事实 —— 被跳过的事件由 chain-watch 的
+ * llmPending 逐个留痕。
+ * 并发下这是**墙钟的上界估计而非精确值**,方向偏保守,故意不修:
+ * chain-watch 的判读前置批是有界并发(LLM_STANCE_CONCURRENCY 默认 3),同一波
+ * 的 3 个调用在入口读到同一个账本值、各自拿满 allowanceMs,记账却在 await 之后
+ * 各加一次 —— 于是账本按"串行之和"计,而真实墙钟是三者的**重叠**(取 max)。
+ * 即账本 ≥ 真实墙钟,帽子只会提前响、绝不迟到:一波并发最多占掉 allowanceMs
+ * 的墙钟(每个调用都被自己的 deadline 钳死),下一波必然读到已加满的账本而被
+ * 挡下,所以"一个 tick 的瞬断墙钟 ≤ 一份预算"这条闭合保证在并发下仍然成立。
+ * 代价只是失败快的并发波会把额度按 ×width 记掉、判读比理论上早停一点 ——
+ * 用区间并集精确记账要引入一套区间合并,对这点收益不值当。 */
+let transientBurnMs = 0;
+let burnCapWarned = false;
+
+/** 账本读数,供运维/测试观察。 */
+export function llmTransientBurnMs(): number {
+  return transientBurnMs;
+}
+
+/** **仅供离线测试**把瞬断墙钟账本归零。生产代码不得调用:一进程一 tick,
+ * 生产的"重置"由进程退出天然完成,tick 中途归零等于把这道硬帽作废。 */
+export function resetLlmTransientBurn(): void {
+  transientBurnMs = 0;
+  burnCapWarned = false;
+}
 
 /** Real CLI invocations this process (excludes cache hits and short-circuits)
  * — the operator's "is the LLM subsystem actually being exercised" signal. */
@@ -356,6 +516,20 @@ function proxyCandidates(): Array<Record<string, string> | undefined> {
   return out;
 }
 
+/** 2026-08-02 审计 finding 8:"切备用代理"这半个修复在生产上是死代码 ——
+ * 已确认 sufe 的 .env 里既没有 LLM_PROXY_FALLBACK 也没有 LLM_PROXY_ALLOW_DIRECT,
+ * proxyCandidates() 恒为 [undefined],三次重试全走同一条挂掉的线路,而运维从
+ * 日志上完全看不出来(文案只说"transient CLI failure",像是对面在抖)。
+ * 于是:重试真的发生、却只有一条线路可走时,在失败告警里点名说破。模块级
+ * flag 保证一个进程只说一次 —— 这行是给运维看的配置提示,不是每次失败都要
+ * 复读的事实。 */
+let noFallbackWarned = false;
+function noProxyFallbackNote(retried: boolean, candidateCount: number): string {
+  if (!retried || candidateCount > 1 || noFallbackWarned) return "";
+  noFallbackWarned = true;
+  return " (无备用代理:未配置 LLM_PROXY_FALLBACK)";
+}
+
 function runClaude(
   prompt: string,
   timeoutMs: number,
@@ -463,7 +637,31 @@ export async function classifyStanceWithLlm(input: {
   // The caller's budget (remaining tick time) is a hard cap; the env knob can
   // only shorten it further, never extend a call past the tick's kill window.
   const envTimeoutMs = Number(process.env.LLM_STANCE_TIMEOUT_MS) || 60_000;
-  const timeoutMs = Math.min(envTimeoutMs, input.timeoutMs ?? envTimeoutMs);
+  // 瞬断墙钟硬帽(2026-08-02 三轮复查 N1,量化依据见 LLM_TRANSIENT_BURN_SHARES)。
+  // 位置在 cache 命中之后:命中不花时间,不该被这道闸挡掉(与 disabledThisProcess
+  // 同一条理由)。
+  const burnCapMs = LLM_TRANSIENT_BURN_SHARES * envTimeoutMs;
+  // 判据与余量都出自 llmBurnGate(纯函数,离线可断言);两个半条件的理由见那里。
+  const { blocked: burnCapTripped, allowanceMs: burnLeftMs } = llmBurnGate(transientBurnMs, burnCapMs);
+  if (burnCapTripped) {
+    if (!burnCapWarned) {
+      burnCapWarned = true;
+      // 文案必须与 disabledThisProcess 的两条(terminal CLI failure / 判读闸门
+      // 关闭本 tick)一眼可分辨 —— 运维 grep 的是"累计瞬断耗时触顶"。
+      console.warn(
+        `[llm-stance] 因累计瞬断耗时触顶,本 tick 停判读(累计 ${transientBurnMs}ms / 帽 ${burnCapMs}ms,` +
+          `余量 ${burnLeftMs}ms < 单次最小尝试 ${LLM_MIN_ATTEMPT_MS}ms);自 ${input.cacheKey} 起降级为正则口径,` +
+          `保住补仓/对账/下单的 tick 预算`
+      );
+    }
+    return null;
+  }
+  // burnLeftMs 参与夹取,是为了让"总烧 ≤ 一份预算"成为闭合保证而不只是近似:
+  // 只在入口判触顶的话,账本停在帽下一点点时(比如调用方给的预算更小、上一次
+  // 没烧满)下一次调用仍可再烧满整份,最坏累计接近两份 —— 那正是本条要消灭的
+  // 120s 形态。夹取后单次预算永远 ≥ LLM_MIN_ATTEMPT_MS(上面的闸保证),健康
+  // 调用实测 5-9s、最慢 9.7s,20s 仍有两倍余量,不会误杀。
+  const timeoutMs = Math.min(envTimeoutMs, input.timeoutMs ?? envTimeoutMs, burnLeftMs);
   const prompt = buildPrompt(input);
   // 立即重试 + 代理切换(2026-08-02):原实现单次失败即 disabledThisProcess,
   // 整个 tick 的判读全关、等下一个 cron tick 才有机会重来。而 preArm 的承诺
@@ -473,20 +671,37 @@ export async function classifyStanceWithLlm(input: {
   const maxTries = Math.max(1, Number(process.env.LLM_STANCE_MAX_TRIES) || 3);
   const backoffMs = Math.max(0, Number(process.env.LLM_STANCE_RETRY_BACKOFF_MS) || 1_500);
   const deadline = Date.now() + timeoutMs;
+  // 单次尝试超时与总预算解耦(2026-08-02 审计 finding 5,依据见
+  // LLM_MIN_ATTEMPT_MS):按 maxTries 均分预算、以 LLM_MIN_ATTEMPT_MS 托底、
+  // 再夹回 timeoutMs。总预算被调用方 wallBudget 压小时(如 15s)公式自然退化
+  // 成"一次尝试用满整个预算"(15s < 20s 下限 → perAttempt=15s,第二轮开头
+  // leftMs≈0 直接 break),不会造出比预算还短的无效切片。
+  const perAttemptMs = perAttemptTimeoutMs(timeoutMs, maxTries);
   let stdout: string | null = null;
   let lastErr = "";
+  // 真实发起的调用次数。预算提前耗尽会让循环少跑几轮,失败告警必须报这个数
+  // 而不是恒定的 maxTries —— 旧文案恒打 "after 3 tries" 掩盖了"其实只跑了 1 次"。
+  let tries = 0;
+  // 本次调用被瞬断烧掉的墙钟(失败尝试 + 其后的退避),循环结束后一次性记入
+  // 模块账本 transientBurnMs(2026-08-02 三轮复查 N1)。
+  let burnedMs = 0;
   for (let attempt = 0; attempt < maxTries; attempt += 1) {
     const proxy = candidates[Math.min(attempt, candidates.length - 1)];
-    // 每次尝试的超时受总预算约束:重试绝不把 tick 拖过 SIGTERM。
+    // deadline 仍是硬上限:单次超时再怎么解耦,也绝不把 tick 拖过 SIGTERM。
     const leftMs = deadline - Date.now();
-    if (leftMs < 5_000) {
-      lastErr = lastErr || "budget exhausted before retry";
+    if (leftMs < LLM_RETRY_MIN_LEFT_MS) {
+      // 同属"日志别骗人":tries=0 时一次都没发起过,别说成"重试前"预算耗尽。
+      lastErr = lastErr || (tries === 0 ? "budget exhausted before first attempt" : "budget exhausted before retry");
       break;
     }
+    const attemptStartedAt = Date.now();
     try {
-      stdout = await runClaude(prompt, Math.min(timeoutMs, leftMs), proxy);
+      tries += 1;
+      stdout = await runClaude(prompt, Math.min(perAttemptMs, leftMs), proxy);
       break;
     } catch (err) {
+      // 只在失败分支记账:成功那次尝试(上面的 break 路径)一分钟都不计。
+      burnedMs += Date.now() - attemptStartedAt;
       lastErr = err instanceof Error ? err.message : String(err);
       if (isTerminalLlmFailure(lastErr)) {
         disabledThisProcess = true;
@@ -500,17 +715,40 @@ export async function classifyStanceWithLlm(input: {
           proxy ? ", proxy fallback" : ""
         }): ${lastErr.slice(0, 200)}`
       );
-      if (attempt + 1 < maxTries && backoffMs > 0 && deadline - Date.now() > backoffMs + 5_000) {
+      if (attempt + 1 < maxTries && backoffMs > 0 && deadline - Date.now() > backoffMs + LLM_RETRY_MIN_LEFT_MS) {
+        const backoffStartedAt = Date.now();
         await new Promise((r) => setTimeout(r, backoffMs));
+        // 退避睡眠同样是被瞬断吃掉的 tick 墙钟,必须计入,否则账本会系统性低估
+        // (maxTries=3 时少算两份 backoffMs)。
+        burnedMs += Date.now() - backoffStartedAt;
       }
     }
   }
+  // 无论本次调用最终成功与否都记账:成功前失败掉的那几次尝试,墙钟确实没了。
+  // 终局故障走的是循环内的 return,不经过这里 —— 那条路径已经把闸门整个关掉,
+  // 账本对它没有意义。
+  transientBurnMs += burnedMs;
   if (stdout == null) {
-    // 全部尝试都失败:本 tick 不再对其他事件重复烧预算,但这是瞬断而非终局,
-    // 下个 tick 会重来(llmPending 亦会补判)。
-    disabledThisProcess = true;
+    // 全部尝试都失败,且是瞬断而非终局(终局在循环里已经 return)。
+    // 2026-08-02 复查 R10:这里**不再**一次失败就掐掉全 tick —— 先只记账,
+    // 攒够 LLM_DISABLE_AFTER_FAILED_KEYS 个不同事件才判线路已死。未达阈值时
+    // 本事件照常返回 null(降级为正则口径,chain-watch 会把它塞进 llmPending
+    // 下轮补判),其余事件的判读闸门保持打开。
+    exhaustedKeys.add(cacheKey);
+    const gateOff = exhaustedKeys.size >= LLM_DISABLE_AFTER_FAILED_KEYS;
+    if (gateOff) disabledThisProcess = true;
+    // 两行文案要能一眼分辨(运维 grep 的是"闸门"两字后面那半句)。
+    const gateNote = gateOff
+      ? `${exhaustedKeys.size} 个不同事件重试耗尽 → 判读闸门关闭本 tick,falling back to regex-only gate for this tick`
+      : `本事件放弃,降级为正则口径;判读闸门仍开(${exhaustedKeys.size}/${LLM_DISABLE_AFTER_FAILED_KEYS} 个不同事件耗尽)`;
+    // 墙钟账本随每次耗尽一起打出来:触顶告警只打一次(状态迁移),运维要回答
+    // "帽子为什么响/还差多少"只能靠这里的流水(2026-08-02 三轮复查 N1)。
     console.warn(
-      `[llm-stance] claude CLI call failed for ${input.cacheKey} after ${maxTries} tries (falling back to regex-only gate for this tick): ${lastErr}`
+      `[llm-stance] claude CLI call failed for ${input.cacheKey} after ${tries}/${maxTries} tries (${gateNote}` +
+        `;本次瞬断烧 ${burnedMs}ms,本 tick 累计 ${transientBurnMs}ms/帽 ${burnCapMs}ms)${noProxyFallbackNote(
+          tries > 1,
+          candidates.length
+        )}: ${lastErr}`
     );
     return null;
   }

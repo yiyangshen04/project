@@ -241,6 +241,25 @@ async function main(): Promise<void> {
       `(actionable=${scan.actionableCount}, observe=${scan.observeCount}, rejected=${scan.rejectedCount})`
   );
 
+  // 机会历史落库(2026-08-02 复盘):persistScanResult 一直只被 Web UI 路由
+  // 调用,cron 路径从未调用 —— 生产 sqlite 的 scan_runs/opportunities/
+  // odds_snapshots 三表至今 0 行,每轮 185~192 个机会打完日志就扔,导致既无法
+  // 做校准也无法回溯"错过了什么"。惰性 require + try/catch:保持 scan-notify
+  // "无 sqlite 也能跑"的既有承诺,落库失败绝不阻塞扫描与告警。
+  // 刻意排在任何网络发送之前(2026-08-02 审计 finding 7):此前落库排在
+  // sendMail 之后且 sendMail 无 try/catch,SMTP 授权码过期或代理瞬断会让 main
+  // 直接 reject,当轮 185~192 个机会一条都不落库 —— 正好废掉本次加落库的全部
+  // 目的。落库是纯本地 sqlite 写、自带兜底,发信失败不得连累落库。
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const db = require("../lib/localDb") as typeof import("../lib/localDb");
+    db.persistScanResult(scan, opportunities);
+  } catch (err) {
+    console.warn(
+      `[scan-notify] 机会落库失败(不阻塞扫描): ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+
   const notifiable = opportunities.filter(isNotifiable);
   const state = loadState();
   const toNotify = notifiable.filter((o) => isNewOrChanged(state, o));
@@ -273,21 +292,6 @@ async function main(): Promise<void> {
   // (disputeCoverage.complete=false)或订单簿抓取失败(booksIncomplete)意味着本
   // 轮机会集可能缺失真实候选——不能静默显示"扫描正常"。
   await handleCoverageDegradation(scan, state);
-
-  // 机会历史落库(2026-08-02 复盘):persistScanResult 一直只被 Web UI 路由
-  // 调用,cron 路径从未调用 —— 生产 sqlite 的 scan_runs/opportunities/
-  // odds_snapshots 三表至今 0 行,每轮 185~192 个机会打完日志就扔,导致既无法
-  // 做校准也无法回溯"错过了什么"。惰性 require + try/catch:保持 scan-notify
-  // "无 sqlite 也能跑"的既有承诺,落库失败绝不阻塞扫描与告警。
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const db = require("../lib/localDb") as typeof import("../lib/localDb");
-    db.persistScanResult(scan, opportunities);
-  } catch (err) {
-    console.warn(
-      `[scan-notify] 机会落库失败(不阻塞扫描): ${err instanceof Error ? err.message : String(err)}`
-    );
-  }
 
   // I6 后半:结算 chain-watch 自动登记的虚拟持仓(30 分钟节奏,有 Gamma)。
   await resolveOpenPaperTrades();

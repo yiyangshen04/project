@@ -61,6 +61,10 @@ import {
   markSettlementsNotified,
   type TradeAttempt,
 } from "../lib/polymarket/tradeExecutor";
+// 补仓复访出队判据(两张 reason 表 + 判定)已抽到零依赖模块 —— 本文件顶层直接
+// main(),import 即跑一整个生产 tick,判据留在这里就永远没有可断言面(第一轮
+// 的 status/reason 回归正是这么溜过全部测试的)。逐条断言见 tests/refillPolicy.test.ts。
+import { shouldKeepInRefillQueue } from "../lib/polymarket/refillPolicy";
 import { priorityOf as tierOf, isGreen, isFatTailShape, type TierVerdict } from "../lib/polymarket/tiering";
 import { isDirectionalStance } from "../lib/virtualTags";
 import { KNOWN_ADAPTERS } from "../lib/polymarket/onchainEvents";
@@ -93,19 +97,27 @@ const TOPIC_ANCILLARY_UPDATED =
   "0x0059e11815211969c0c4aaf3f498b52b6c2f2d14f286275d0862d70de22a836b";
 const GET_QUESTION_SELECTOR = "0x58c039cd";
 
-// Max lookback after downtime: ~3600 blocks ≈ 2 hours. publicnode only serves
+// Max lookback after downtime: ~3600 blocks ≈ 1.5 hours. publicnode only serves
 // getLogs hugging the chain head (~127 blocks), so deeper pages fall through to
 // the fallback RPCs (nodies/tenderly) that allow ~100-block windows at any
 // depth. 3600 covers the largest gaps observed in production (2878 blocks);
 // beyond it we accept the gap but ALWAYS email an alert (see gap handling
 // below) so a permanent miss is never silent.
+// 口径修正(2026-08-02 复查):旧注释按 2s/块记作 ~2 小时。Polygon 出块实测
+// 1.5000 s/块(2026-08 实测,5 个独立样本,与 lib/polymarket/onchainEvents.ts
+// 顶部同源),3600 块实为 ~1.5 小时。常量数值不动 —— 生产观测到的最大缺口
+// 2878 块仍在窗口内,超出部分本来就走 gap 告警,不存在静默漏扫。
 const HEAD_WINDOW = 3600;
 
 // Confirmation depth: scan and advance the cursor only up to head-CONFIRMATIONS,
 // not the unconfirmed latest head. A getLogs page that lands on a lagging RPC
 // replica (or a shallow reorg) would otherwise return "success but missing the
 // tail blocks" while the cursor sails past them — a permanent silent miss.
-// ~25 blocks ≈ 50s on Polygon; the cost is that much extra notification delay.
+// ~25 blocks ≈ 37.5s on Polygon; the cost is that much extra notification delay.
+// 口径修正(2026-08-02 复查):旧注释按 2s/块记作 ~50s;实测 1.5000 s/块
+// (2026-08 实测,5 个独立样本,与 lib/polymarket/onchainEvents.ts 顶部同源)。
+// 常量不动 —— 确认深度按"块数"定义(抗重组/抗滞后副本的语义就是块数),
+// 出块提速只是让同样 25 块的延迟代价更小,方向有利。
 const CONFIRMATIONS = 25;
 
 // Sanity bound: on a non-first run, a single tick's head must not jump more
@@ -113,7 +125,11 @@ const CONFIRMATIONS = 25;
 // mis-route and return another chain's much higher block number; without this
 // guard the cursor gets poisoned to that fake head and every later tick reports
 // "no new blocks" while the channel is silently dead.
-const MAX_HEAD_ADVANCE = 200_000; // ~4.8 days of Polygon blocks
+// 口径修正(2026-08-02 审计):旧注释按 2s/块记作 ~4.8 天,但本批实测 Polygon
+// 出块 1.5000 s/块(5 个独立样本),200_000 块实为 ~3.47 天。数值不动 —— 3.47 天
+// 的容忍窗口对"停机几天后重启"仍够用,而串链误路由的假 head 差着几千万块,
+// 无论 3.47 还是 4.8 天都照样拦下。
+const MAX_HEAD_ADVANCE = 200_000; // ~3.47 days of Polygon blocks @1.5000s/block
 
 // Per-tick sweep cap. A full HEAD_WINDOW catch-up is 75 sequential getLogs
 // pages plus enrichment — that can overrun run-cron's 170s tick timeout, and
@@ -142,6 +158,24 @@ const FLOOD_MAX = Number(process.env.CHAIN_WATCH_FLOOD_MAX) || 12;
 const DIGEST_MAX_AGE_MS = 6 * 3600_000;
 const DIGEST_MAX_SIZE = 40;
 
+/** digestQueue 触顶(>100)截断时优先让位的 reason 集合(2026-08-02 审计)。
+ * 判据是"丢了会不会丢掉一次机会":prearm_expired 只是"预埋到点未落文本"的
+ * 信息性面包屑,且**天然是批量的**(批量裁定日一次预埋数十个姊妹市场,到点
+ * 集体过期),正是真实的挤压压力源,保留在集合里。而 flood/blue_no_edge/
+ * llm_gave_up 是指纹已提交的方向性事件,丢即永久,必须最后才丢。
+ *
+ * llm_pending_evicted 移出(2026-08-02 三轮复查):这条的取舍随本批第二轮的改法
+ * 反转了。第二轮之前它是逐条 push,洪水 tick 一次灌 404-413 条 —— 那时它确实
+ * 是压力源,优先让位是对的;第二轮压成**一次淘汰只占 1 条**聚合条目之后,1 条
+ * 构不成任何挤压压力,却仍被排在最先丢。而队列溢出(>100)几乎只发生在洪水
+ * tick,恰恰就是产生这条聚合条目的同一个 tick —— 于是它必被丢中,汇总邮件里
+ * 对"本 tick 淘汰 400 条、均不再补判"一个字都不提。留痕挤走的正是它自己要留的
+ * 痕(与它第二轮想修的病同形)。chain-watch-llm-evicted 结构化日志行(gzip 归档
+ * 84 天)只是事后可翻的兜底,不能替代运维当天在邮件里看见这件事。
+ * 代价:溢出时多留 1 条,至多把 1 条方向性事件从 splice(0, toDrop) 的队首挤掉
+ * —— 而这条聚合条目本身就承载着"400 条判读永久消失"的事实,量级不对等。 */
+const DIGEST_DROPPABLE_REASONS = new Set(["prearm_expired"]);
+
 /** 每 tick 最多做几个盘口核查(I1)—— 每个约 2-4 次代理往返(negRisk 再加
  * ≤2 次直连 ethCall)。2026-07-15 SOOP 批 9 个姊妹盘只注解上 6 个,唯一 YES
  * 腿(批量澄清里仅有的肥尾腿)排第 8 连查询都没轮上 → 提到 12。断网 tick
@@ -163,6 +197,7 @@ const REFILL_WINDOW_MS = Number(process.env.CHAIN_WATCH_REFILL_WINDOW_MS) || 12 
 const REFILL_MAX_TRIES = Number(process.env.CHAIN_WATCH_REFILL_MAX_TRIES) || 4;
 /** 单 tick 最多复访几个 token(预算保护:复访排在新信号之后)。 */
 const REFILL_MAX_PER_TICK = 4;
+
 /** 预埋名单上限。bt5 实测 15 个月 80 个市场,批量裁定日一次可预埋数十个姊妹市场。 */
 const PREARM_MAX = 80;
 /** 承诺时点前多早进入快轮询。官方偶有提前 1-2 分钟落文本。 */
@@ -1395,31 +1430,45 @@ async function main(): Promise<void> {
       // (队列被挤爆、这批事件永不复判)完全不可见。
       // 洪水日被淘汰的绝大多数是 rule_context 模板盘(bt3 口径期望为负,不值
       // 得补判),所以这里不扩容队列,只保证「丢了什么」留痕并进 digest。
+      // 单条聚合留痕(2026-08-02 审计):此处原为逐条 push,洪水日一次 tick 就
+      // 往 digestQueue 灌 404-413 条 —— 而队列上限只有 100,溢出部分走
+      // splice(0, toDrop) 从队首丢,丢掉的恰是更早入队的真方向性事件(flood/
+      // blue_no_edge/llm_gave_up,指纹已提交、丢即永久)。留痕本身把它要留痕的
+      // 东西挤没了。改成一次淘汰只占 1 条:条目里带淘汰条数与前 20 个 qid 前缀
+      // (与下面 chain-watch-llm-evicted 日志行同口径),全量 qid 去结构化日志里翻。
       const evicted = pendingKeys.slice(0, pendingKeys.length - 50);
+      // 已发 🟠 等绿档升级的那部分最值钱(§5 语义),单独计数顶到标题上。
+      let evictedMailedDirectional = 0;
       for (const k of evicted) {
-        const e = state.llmPending[k];
+        if (state.llmPending[k]?.mailedDirectional) evictedMailedDirectional += 1;
         delete state.llmPending[k];
-        state.digestQueue.push({
-          qid: k,
-          title: e?.title ?? null,
-          label: `⚠ 判读队列超限(>50)淘汰 —— 本事件不再补判(attempts=${e?.attempts ?? 0})`,
-          stance: "llm_pending_evicted",
-          llmStance: null,
-          bestAsk: null,
-          askUsd: null,
-          marketUrl: null,
-          trade: null,
-          reason: "llm_pending_evicted",
-          at: Date.now(),
-        });
       }
+      const evictedHeads = evicted.slice(0, 20).map((k) => k.slice(0, 12));
+      state.digestQueue.push({
+        // 聚合条目无单一 qid;flushDigest 只把它当展示字段用(title 优先)。
+        qid: `llm_pending_evicted@${new Date().toISOString()}`,
+        title: `⚠ 判读队列超限(>50):本 tick 淘汰 ${evicted.length} 条,均不再补判`,
+        label:
+          `⚠ 判读队列超限淘汰 ${evicted.length} 条(其中已发🟠待绿档升级 ${evictedMailedDirectional} 条)` +
+          ` · 前 ${evictedHeads.length} 个 qid:${evictedHeads.join(" ")}`,
+        stance: "llm_pending_evicted",
+        llmStance: null,
+        bestAsk: null,
+        askUsd: null,
+        marketUrl: null,
+        trade: null,
+        reason: "llm_pending_evicted",
+        at: Date.now(),
+      });
       console.log(
         JSON.stringify({
           mode: "chain-watch-llm-evicted",
           at: new Date().toISOString(),
           evicted: evicted.length,
           kept: 50,
-          qids: evicted.slice(0, 20).map((k) => k.slice(0, 12)),
+          // digest 侧现在只留 1 条聚合面包屑,全量细节以本行为准(2026-08-02 审计)。
+          mailedDirectional: evictedMailedDirectional,
+          qids: evictedHeads,
         })
       );
     }
@@ -1479,7 +1528,17 @@ async function main(): Promise<void> {
     if (llmBudgetLeftMs() < 10_000) break;
     const effStance = effDirectionalStance(item);
     if (!effStance) continue;
-    item.exec = await checkExecutability({ adapter: item.adapter, qid: item.qid, stance: effStance });
+    item.exec = await checkExecutability({
+      adapter: item.adapter,
+      qid: item.qid,
+      stance: effStance,
+      // 与下方 executeSignal / refillQueue 的 declarative 逐字同源(applyStanceFromUpdates
+      // 已在 enrich 阶段置位,此处必然已就绪)。不传的后果不是"注解略糙":paper
+      // 登记读的正是本次注解的 fillAvail,天花板走普通档绝对滑点带就会比实盘限价
+      // 窄(ask 0.20 处 0.23 vs 0.32),宣告腿被系统性少记 shares/usd 并误打
+      // limitCapped —— 偏差方向单一,把 go/no-go 的样本源美化成"入场价优于实盘"。
+      declarative: item.declarative === true,
+    });
     execChecked += 1;
   }
 
@@ -1637,7 +1696,28 @@ async function main(): Promise<void> {
           label: pr.label,
           // 薄簿分桶(2026-08-02):capped=true 表示限价内深度吃不满 $100,
           // 这类样本的名义收益率不可与足额样本混算 —— go/no-go 分层用。
+          // (历史键名 depthCapped = execCheck 的 fillAvail.capped;沿用不改,
+          // 否则已落库的行与新行分桶键不一致。)
           depthCapped: fill.capped,
+          // 三分桶落库(2026-08-02 复查):execCheck.fillAvail 的文档注释承诺
+          // go/no-go 按「足额 / 纯深度不足 / 限价截断」三桶分开算,但此前只落
+          // depthCapped,三桶事后**重建不出来** —— limitCapped 尤其不可反推:
+          // 它取决于当时 walk 用的天花板,而天花板(公式订正,2026-08-02 三轮
+          // 复查:本注释原文照抄的是第一轮那版 min(bestAsk+EXEC_SLIPPAGE, 0.99),
+          // 第二轮已改成直接调实盘那支)= limitPriceFor(bestAsk, declarative, cfg)
+          // = execCheck.ts:491,即**实盘该腿此刻会挂的限价本身**。它有两个不可
+          // 反推的自由度:① env(EXEC_SLIPPAGE / EXEC_SLIPPAGE_EDGE_FRAC /
+          // EXEC_MAX_PRICE);② declarative —— 宣告腿(官方文本直接写明结算结果)
+          // 走 upDriftBand 按剩余边缩放,天花板比普通档**更宽**(priceBands.ts:59,
+          // 例:ask 0.66 时普通档 0.69、宣告档 0.71),同一个 ask 在两个子类下的
+          // 天花板并不相同。故两个字段一并落库,键名与 execCheck 一致
+          // (fillAvail.limitCapped / fillAvail.ceiling)。
+          //   · !depthCapped               → 足额桶(唯一可直接进主口径均值)
+          //   · depthCapped ∧ !limitCapped → 纯深度不足(薄簿桶:价格可信、规模不可信)
+          //   · limitCapped                → 限价截断桶(薄簿+价差,不是策略容量)
+          limitCapped: fill.limitCapped,
+          // 本次 walk 实际使用的价格上界,留痕供按当时的带宽复算。
+          ceiling: fill.ceiling,
           depthUsd: Math.round(fill.usd * 100) / 100,
           askUsdNear: e.askUsdNear,
           executable: e.executable,
@@ -1878,16 +1958,20 @@ async function main(): Promise<void> {
   // 他人吃走并全部结算 $1。信号不会重复触发,所以引擎必须自己回头看盘口。
   // 排在新信号之后:补仓永远不许挤占新机会的 tick 预算。
   const sweepRefillQueue = async (): Promise<void> => {
-    if (!REFILL_ENABLED || executionMode() !== "live") return;
     const queue = state.refillQueue;
     if (!queue) return;
     const now = Date.now();
+    // 过期/超次清理无条件先做(2026-08-02 审计):原先 mode 闸写在扫描之前直接
+    // return,于是 kill-switch 触发、或 EXEC_MODE 切 dry/off 期间入队的条目永久
+    // 滞留在 data/chain-watch-state.json,状态文件只增不减。清理只删本地条目、
+    // 不碰真金,不该受 live 约束;受 live 约束的只有下面真正发起 executeSignal
+    // 的那段。
+    for (const [tokenId, r] of Object.entries(queue)) {
+      if (now > r.expiresAt || r.tries >= REFILL_MAX_TRIES) delete queue[tokenId];
+    }
+    if (!REFILL_ENABLED || executionMode() !== "live") return;
     let done = 0;
     for (const [tokenId, r] of Object.entries(queue)) {
-      if (now > r.expiresAt || r.tries >= REFILL_MAX_TRIES) {
-        delete queue[tokenId];
-        continue;
-      }
       if (done >= REFILL_MAX_PER_TICK || wallBudgetLeftMs() < 45_000) break;
       r.tries += 1;
       done += 1;
@@ -1948,13 +2032,8 @@ async function main(): Promise<void> {
           freshAsk: attempt.freshAsk,
           feeUsd: attempt.feeUsd,
         });
-        // 该 token 敞口已打满 / 市场已无可成交盘口 → 没有再来一次的意义。
-        if (
-          attempt.status === "skipped" &&
-          /累计敞口已满|盘口无卖单|同事件聚合敞口已满|kill-switch|连亏/.test(attempt.reason ?? "")
-        ) {
-          delete queue[tokenId];
-        }
+        // 白名单出队(见 shouldKeepInRefillQueue):只有瞬态结果才配再来一次。
+        if (!shouldKeepInRefillQueue(attempt)) delete queue[tokenId];
       } catch (err) {
         console.warn(
           `[chain-watch] 补仓复访异常(${tokenId.slice(0, 10)}): ${err instanceof Error ? err.message : String(err)}`
@@ -2026,12 +2105,16 @@ async function main(): Promise<void> {
     });
   }
   if (state.digestQueue.length > 100) {
-    // 截断分层(审查 major):信息性面包屑(prearm_expired)先让位,方向性事件
-    // (flood/blue_no_edge/llm_gave_up)最后才丢 —— 否则批量预告过期会把真正
-    // 的方向性信号从队列里静默挤掉(其指纹已提交,丢即永久)。
+    // 截断分层(审查 major):信息性面包屑(DIGEST_DROPPABLE_REASONS)先让位,
+    // 方向性事件(flood/blue_no_edge/llm_gave_up)最后才丢 —— 否则批量预告过期
+    // 会把真正的方向性信号从队列里静默挤掉(其指纹已提交,丢即永久)。
+    // 2026-08-02 审计:面包屑集合由单一 reason 改为具名 Set,避免再往这里堆 || 串。
+    // 三轮复查:llm_pending_evicted 已移出该集合(聚合成 1 条后不再是压力源,而
+    // 溢出 tick 恰是产生它的那个 tick,让位=汇总里永远看不到淘汰事实)——理由写在
+    // DIGEST_DROPPABLE_REASONS 定义处。
     let toDrop = state.digestQueue.length - 100;
     state.digestQueue = state.digestQueue.filter((d) => {
-      if (toDrop > 0 && d.reason === "prearm_expired") {
+      if (toDrop > 0 && DIGEST_DROPPABLE_REASONS.has(d.reason)) {
         toDrop -= 1;
         return false;
       }
@@ -2329,7 +2412,15 @@ async function main(): Promise<void> {
               ? item.llm.stance
               : null;
           if (effStance && wallBudgetLeftMs() > 10_000) {
-            item.exec = await checkExecutability({ adapter: item.adapter, qid, stance: effStance });
+            // declarative 同上(P1 快轮询路径):applyStanceFromUpdates 在本函数
+            // 上方几行刚跑过,item.declarative 已就绪。宣告扫单最肥的窗口正是
+            // 这条快路径(定时澄清落地 ±31s),天花板不能比实盘限价窄。
+            item.exec = await checkExecutability({
+              adapter: item.adapter,
+              qid,
+              stance: effStance,
+              declarative: item.declarative === true,
+            });
           }
           // §13:首轮真实盘口价即锚定,跨轮传递 —— 重试轮重新注解的 bestAsk
           // 已被落地后的重定价推高,拿它当漂移带基准等于放行追高。

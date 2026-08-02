@@ -67,6 +67,8 @@ import { homedir } from "os";
 import { CLOB_API, GAMMA_API } from "./config";
 import { ethCall } from "./oracleState";
 import { writeFileAtomic } from "../fsAtomic";
+// 限价带纯函数(与 execCheck 共用的唯一一份实现;本模块另行 re-export)。
+import { upDriftBand, limitPriceFor } from "./priceBands";
 
 export type ExecMode = "off" | "dry" | "live";
 
@@ -272,29 +274,16 @@ export const isTransportAmbiguous = (
   haveFill: boolean
 ): boolean => !haveFill && resp?.error != null && resp?.status == null && resp?.orderID == null;
 
-/** 上行漂移容忍带(§2.3):绝对带在低价位是过窄的相对档 —— 肥尾回归途中
- * 0.164→0.20 仍 +400% EV 却被 0.03 绝对带拒单。带宽按剩余边(1−signalAsk)
- * 缩放,高价位退化回绝对带(只放宽低价位,绝不收紧既有行为)。 */
-export const upDriftBand = (signalAsk: number, slippage: number, edgeFrac: number): number =>
-  Math.max(slippage, edgeFrac * (1 - signalAsk));
-
-/** 限价帽(2026-08-02 宣告扫单)。
- *
- * 普通 🟢:维持绝对滑点带(freshAsk + slippage)。bt3 均值 +21.3%/笔,这条边
- * 很薄,把帽子放宽是确定的 EV 侵蚀换不确定的成交量,n=1 证据不足以支撑。
- *
- * 宣告类(官方文本直接写明结算结果,历史兑现 98.8%):按边缩放放宽,与漂移带
- * 同一口径。这个子类里"少买"的成本远高于"多付两个价位" —— 对一张几乎确定
- * 赔付 $1 的票,0.664 买是 +50.6%、0.711 买是 +40.8%,两倍的量显然胜过略高的
- * 单位赢面。2026-07-28 实测:成交后 4.5 分钟内 ≤0.69 的 85 股被他人吃走。 */
-export const limitPriceFor = (
-  freshAsk: number,
-  declarative: boolean,
-  cfg: Pick<ReturnType<typeof execConfig>, "slippage" | "slippageEdgeFrac" | "maxPrice">
-): number => {
-  const band = declarative ? upDriftBand(freshAsk, cfg.slippage, cfg.slippageEdgeFrac) : cfg.slippage;
-  return Math.min(Math.round((freshAsk + band) * 100) / 100, cfg.maxPrice, 0.99);
-};
+/** 上行漂移带 upDriftBand / 限价帽 limitPriceFor 已抽取到零依赖的
+ * ./priceBands(2026-08-02 复查):execCheck 的 fillAvail 天花板必须与实盘限价
+ * **逐字同源**,而 execCheck 不能 import 本模块(执行层带钱包/账本/fs 副作用,
+ * 反向 import 是依赖方向倒置+循环隐患)。第一轮"两边各写一份公式"的代价已实测:
+ * 宣告档在 ask 0.20 处天花板窄了 0.09,paper 池(go/no-go 样本源)被系统性
+ * 自我美化。此处 re-export 保持既有导入路径不变(本文件内部调用 +
+ * tests/tradeExecutor.test.ts 从本模块导入),行为逐字未变。
+ * cfg 形参类型由 Pick<ReturnType<typeof execConfig>,…> 换成 priceBands 自带的
+ * 结构化 LimitBandConfig —— 两者结构完全一致,execConfig() 的返回值照常可传。 */
+export { upDriftBand, limitPriceFor } from "./priceBands";
 
 /** 下行暴跌阈值(§2.3 对称侧):freshAsk 跌破信号价这么多 = 市场把裁定读成了
  * 反方向,此刻的"便宜"是毒饵 —— skip 待人工复核,不能当折扣照买。 */
@@ -900,20 +889,60 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
       // 一次就对该市场永久失明 —— 07-28 成交($47)后 4.5 分钟内又挂出约 85 股
       // ≤0.69 的货(全部落在我方当时的限价内),被他人吃走且全部结算 $1。
       // 改为 per-token 累计敞口上限:未达上限时放行并按剩余额度缩单。
-      const tokenExposure = ledger
-        .filter((e) => e.tokenId === input.tokenId && !e.probe)
-        .reduce((s, e) => s + exposedUsd(e), 0);
+      //
+      // 2026-08-02 审计 finding 9:上面这个累计口径是「终身毛额」—— exposedUsd
+      // 只看 filledUsd/requestedUsd,从不扣除已结算回款,单调不减;而
+      // perTokenMaxUsd 默认 = EXEC_MAX_ORDER_USD(生产 $100),于是「一次吃满就把
+      // 该 token 永久封死」,与上面刚替换掉的二值封锁在效果上等价。修法:按
+      // settledFinal(与 openExposureUsd 内部同一套判定)扣掉已结算的行,拿净敞口
+      // 判闸。核销只放宽不放大:单笔仍受 maxOrderUsd/日/总/同事件帽约束,同一
+      // token 的「在险(未结算)敞口」上界仍是 perTokenMaxUsd。
+      //
+      // 2026-08-02 复查:第一轮在这里挂了第二跳 —— 本地缓存下仍触顶就顺手做一次
+      // **全 ledger** 未结算持仓的 Gamma 扫描(openExposureUsd,≤12s;当时为此还抽了
+      // 个 settleAndNetTotal 记忆化壳,现已随本跳一并删除)。两个问题:
+      //  ① 热路径成本。per-token 帽只关心这一个 token,却按全表付费;补仓复访每
+      //    tick 最多 4 次、每次重跑,而澄清落地后的肉只有 20-60s(官方行为规律
+      //    研究 2026-07 H4),12s 花在这里就是漏单。第一轮为此不得不给既有测试加
+      //    budgetMs:14_000 才能让闸门断言不触网,本身就是信号。
+      //  ② 那一跳的收益近乎恒为零。tokenId 唯一对应一个 conditionId,故净敞口只有
+      //    两种取值:未结算 = 毛额(探测改变不了结论)、已结算 = $0;而 cid 一旦
+      //    结算市场即关停,这个 token 要么根本买不到(下方新鲜盘口即"无卖单"),
+      //    要么只剩结算价附近的残单(花 ~$1 买赔付 $1,EV≈0)。换言之 Gamma 那一跳
+      //    最多把一个买不到/没赚头的 token 从 skip 改成 skip。
+      // 于是只保留纯本地缓存这一跳(零网络、单次小文件读):trade-settled.json 由
+      // 每 tick 的 reconcileSettlements 与 totalLeft 那条的全表核销共同推进,滞后
+      // 至多一个 tick,而滞后的唯一后果是"晚一个 tick 解封一个买不到的 token"。
+      // 方向上更保守:缓存未知一律按「仍在险」计(fail-closed),敞口上界不变。
+      let tokenRows = ledger.filter((e) => e.tokenId === input.tokenId && !e.probe);
+      const tokenGross = tokenRows.reduce((s, e) => s + exposedUsd(e), 0);
+      let tokenExposure = tokenGross;
+      if (mode === "live" && tokenGross > 0) {
+        // 不再设"毛额过半才核销"的门槛:那个门槛是为了省下 Gamma 往返,纯缓存
+        // 读没有这个成本。门槛留着反而有害 —— 毛额 $30(上限 $100)且早已结算时
+        // tokenLeft 会被静默缩成 $70,与 totalLeft 被判为缺陷的是同一个毛/净混淆。
+        const settled = loadSettledCache(cfg);
+        tokenRows = tokenRows.filter((e) => !(e.conditionId && settledFinal(settled[e.conditionId])));
+        tokenExposure = tokenRows.reduce((s, e) => s + exposedUsd(e), 0);
+      }
       // dry 模式维持二值封锁(干跑不需要补仓语义,否则每 tick 重复构单)。
+      // 2026-08-02 审计 finding 13:重构后 dry 分支只匹配旧的 dry 行,丢掉了原判据
+      // 里的 exposedUsd(e) > 0 —— 某 token 已有 $10 实盘持仓时,dry 跑同一信号会
+      // 照常构单+签名并发出"已构单"的 dry 邮件,读信人看不到「已有持仓」这个
+      // 关键上下文。恢复为「任何实盘敞口 ∪ 旧 dry 行」;live 的累计口径不受影响。
       const dryDup =
         mode === "dry"
           ? ledger.find(
-              (e) => e.tokenId === input.tokenId && !e.probe && e.mode === "dry" && e.status === "dry"
+              (e) =>
+                e.tokenId === input.tokenId &&
+                !e.probe &&
+                (exposedUsd(e) > 0 || (e.mode === "dry" && e.status === "dry"))
             )
           : undefined;
       const dup =
         dryDup ??
         (mode === "live" && tokenExposure >= cfg.perTokenMaxUsd
-          ? ledger.find((e) => e.tokenId === input.tokenId && !e.probe && exposedUsd(e) > 0)
+          ? tokenRows.find((e) => exposedUsd(e) > 0)
           : undefined);
       if (dup) {
         // P1 快轮询邮件失败重试会整段重放到这里(审计 2026-07-11 §8):重试轮
@@ -930,8 +959,14 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
           status: "skipped",
           reason:
             mode === "live"
-              ? `该 token 累计敞口已满($${tokenExposure.toFixed(0)}/${cfg.perTokenMaxUsd};${dup.at} ${dup.status}${held})`
-              : `已对该 token 执行过(${dup.at} ${dup.status}${held})`,
+              ? // 文案带双口径(2026-08-02 审计):净 ≠ 毛额时一眼看出「核销确实跑过了、
+                // 钱也确实还在险」,与修复前只有单一数字的旧文案可区分。"累计敞口已满"
+                // 这个词干必须保留 —— gonogo-materials.ts 的 bucketOf 与
+                // tests/tradeExecutor.test.ts 按它归"额度闸"桶。
+                `该 token 累计敞口已满(净 $${tokenExposure.toFixed(0)}/${cfg.perTokenMaxUsd};毛额 $${tokenGross.toFixed(0)},已扣除已结算部分;${dup.at} ${dup.status}${held})`
+              : dup.mode === "live"
+                ? `该 token 已有实盘敞口,dry 不重复构单(${dup.at} ${dup.status}${held})`
+                : `已对该 token 执行过(${dup.at} ${dup.status}${held})`,
           ...(dup.status === "filled" || dup.status === "partial"
             ? { subjectAlert: `已持仓$${Math.round(dup.filledUsd ?? 0)}` }
             : dup.posted === "unknown"
@@ -975,6 +1010,11 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
       // 已结算条目零网络调用,代价极低。
       let openTotal = ledger.reduce((s, e) => s + exposedUsd(e), 0);
       if (mode === "live" && openTotal >= cfg.totalMaxUsd * 0.5) {
+        // 全表口径不变(2026-08-02 复查):totalMax 是全局在险敞口,必须扫全部
+        // 未结算 conditionId,这一跳的 ≤12s 是它本来的价钱。此处也是热路径上唯一
+        // 会推进 trade-settled.json 的核销点(另一个是 tick 末的 reconcile),
+        // per-token 帽的纯缓存读因此仍有活水。第一轮曾把这里改成复用 per-token
+        // 那跳的记忆化结果,现已随该跳一并撤回,预算/口径与更早版本逐字一致。
         openTotal = await openExposureUsd(
           ledger,
           cfg,

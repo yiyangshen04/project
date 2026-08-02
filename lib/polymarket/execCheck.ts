@@ -35,6 +35,8 @@
 import { GAMMA_API, CLOB_API } from "./config";
 import { conditionIdFor } from "./keccak";
 import { ethCall } from "./oracleState";
+// 限价帽:与实盘下单共用的唯一一份实现(零依赖模块,不引入执行层副作用)。
+import { limitPriceFor, type LimitBandConfig } from "./priceBands";
 import type { GammaMarket, OrderBook } from "../types";
 
 export const MIN_EXEC_USD = 100;
@@ -42,6 +44,59 @@ export const MIN_EXEC_USD = 100;
  * price you'd pay", they're the slippage cliff. */
 const NEAR_ASK_BAND = 0.05;
 const FETCH_TIMEOUT_MS = 6_000;
+
+/** fillAvail 走簿的限价天花板 = 实盘该腿的限价,直接调 limitPriceFor
+ * (lib/polymarket/priceBands,与 tradeExecutor 下单用的**是同一个函数**),
+ * 天花板以上的档位实盘根本吃不到。2026-08-02 审计:本批把 paper 登记门槛从
+ * fill100 放宽成 fillAvail 之后,无上界的 walk 会把远端档位算进 avgPrice ——
+ * bestAsk 0.66 只有 3 股、下一档 0.95 有 200 股时得出 avgPrice≈0.92 并登记成一笔
+ * paper 交易,而实盘限价只有 0.69,这笔"成交"永不存在。
+ *
+ * 2026-08-02 复查(本轮修的是第一轮修复自身的回归):第一轮把天花板写死成
+ * bestAsk + EXEC_SLIPPAGE,对**宣告类**腿系统性偏窄 —— 实盘宣告档走
+ * upDriftBand(按剩余边缩放):
+ *   ask 0.200 → 天花板 0.230 vs 实盘限价 0.320(窄 0.090)
+ *   ask 0.500 → 0.530 vs 0.570(窄 0.040)
+ *   ask 0.664 → 0.694 vs 0.710(窄 0.016)
+ * 宣告子类(历史兑现 98.8%,本批刚放宽限价帽的正是它)是 EXEC_FORECAST_LIVE
+ * 验证期与 8 月 go/no-go 的样本源;少记 shares/usd 并误打 limitCapped 的偏差
+ * 方向单一:paper 记的入场价优于实盘真实成交价(自我美化)。
+ * 同时纠正第一轮那句"天花板至多宽 1 分钱、不会把实盘能成交的样本挡在外面"
+ * 的断言 —— 它是错的:ask=0.666 时旧天花板 0.696,而实盘限价
+ * round(0.696×100)/100 = 0.70,天花板反而**更窄**,0.001 tick 的市场上 0.70
+ * 那一档被错误排除。改用同一个函数后不存在方向不定的残差。
+ *
+ * 取舍未变:仍不 import tradeExecutor —— execCheck 是注解层叶子模块
+ * (tiering/localDb/heartbeat/chain-watch 共用),tradeExecutor 是带钱包/账本/fs
+ * 副作用的执行层,反向 import 既是依赖方向倒置也埋循环隐患。改为双方共同依赖
+ * 零依赖的 ./priceBands(它不 import 任何 polymarket 模块,无环)。剩下的唯一
+ * 漂移面是下面这三个 env 默认值,须与 execConfig 保持一致。 */
+
+/** 数值 env → 值。显式 0 是合法配置(EXEC_SLIPPAGE=0 且 edgeFrac=0 时天花板
+ * 退化为"只吃取整到分档以内的最优档");未设/空串走默认;垃圾值(NaN/负数)
+ * loud-warn 后走默认 —— 与 tradeExecutor 的 num() 同口径,静默吞掉会让
+ * "操作员设了 0"与"配错了"不可区分。 */
+function envNum(name: string, dflt: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return dflt;
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v < 0) {
+    console.warn(`[exec-check] 环境变量 ${name}="${raw}" 非法,使用默认 ${dflt}`);
+    return dflt;
+  }
+  return v;
+}
+
+/** 天花板配置(每次注解现读 env,与实盘同一时刻的 execConfig 取值一致)。
+ * 三个键名与默认值逐字抄自 tradeExecutor.execConfig(2026-08-02),不得臆造:
+ * EXEC_SLIPPAGE 0.03 / EXEC_SLIPPAGE_EDGE_FRAC 0.15 / EXEC_MAX_PRICE 0.97。 */
+function ceilingConfig(): LimitBandConfig {
+  return {
+    slippage: envNum("EXEC_SLIPPAGE", 0.03),
+    slippageEdgeFrac: envNum("EXEC_SLIPPAGE_EDGE_FRAC", 0.15),
+    maxPrice: envNum("EXEC_MAX_PRICE", 0.97),
+  };
+}
 
 export interface ExecFill {
   price: number;
@@ -73,18 +128,49 @@ export interface ExecCheck {
   executable: boolean;
   /** Simulated $100 market buy walking the asks (null when book too thin). */
   fill100: { avgPrice: number; worstPrice: number; shares: number; usd: number; fills: ExecFill[] } | null;
-  /** 尽力口径:走完限价内可得的 asks,不要求吃满 MIN_EXEC_USD(capped=true
-   * 表示深度不足 $100)。2026-08-02 复盘:paper 池上线至今 0 行,根因是登记
-   * 门槛挂在 fill100 上,而实测最厚一腿深度只有 ~$52 —— 连唯一那笔 +48% 的
-   * 真实成交都不够格登记,预告家族"paper 验证期"因此永远无法结束(死锁)。
-   * 回测的"真可执行"口径仍看 executable/fill100,不受本字段影响。 */
+  /** 尽力口径:在限价天花板内走完可得的 asks,不要求吃满 MIN_EXEC_USD。
+   * 2026-08-02 复盘:paper 池上线至今 0 行,根因是登记门槛挂在 fill100 上,
+   * 而实测最厚一腿深度只有 ~$52 —— 连唯一那笔 +48% 的真实成交都不够格登记,
+   * 预告家族"paper 验证期"因此永远无法结束(死锁)。
+   * 回测的"真可执行"口径仍看 executable/fill100,不受本字段影响。
+   *
+   * 2026-08-02 审计(finding 4):walk 加了限价天花板 ceiling,只吃实盘限价买得到
+   * 的档位;08-02 复查起天花板 = limitPriceFor(bestAsk, declarative, cfg),即实盘
+   * 该腿的限价本身(宣告档按剩余边缩放,不再被普通档的绝对滑点带压窄)。
+   * 常规价位下天花板 ≥ bestAsk,最优档永远在内,登记死锁不会因此复发;例外只有
+   * 两种,且都是实盘同样吃不到的形态,fillAvail=null 是正确镜像:
+   *  · bestAsk > EXEC_MAX_PRICE(默认 0.97)—— 实盘走"ask > 上限(尾价/已重定价)"
+   *    直接 skip;
+   *  · 显式把 EXEC_SLIPPAGE 与 EXEC_SLIPPAGE_EDGE_FRAC 都配成 0 —— 带宽归零后
+   *    round(ask×100)/100 可能落在 ask 之下(0.664→0.66),实盘同样因"限价内深度
+   *    为 0"skip。
+   * 加了天花板之后 fillAvail 与 fill100 走的是两次独立 walk,厚簿但价差大的盘会
+   * 出现"fill100 非空、fillAvail 却 capped"的组合 —— 这不是矛盾,正是两个口径的
+   * 差别所在。
+   *
+   * 两个 capped 语义不同,go/no-go 分桶必须分开看:
+   *  · capped=false            → 天花板内吃满 $100,价格实盘拿得到。**唯一可
+   *    直接进主口径均值的桶。**
+   *  · capped ∧ !limitCapped   → 纯深度不足(限价内的档位全吃光也不到 $100)。
+   *    价格可信、规模不可信;单列"薄簿桶",名义收益率不与足额样本混算均值。
+   *  · limitCapped=true        → walk 被天花板截断(蕴含 capped:只有没吃满
+   *    才可能是被截断)。usd/shares 是实盘该价位上真能拿到的量,更深的便宜货
+   *    并不存在;单列"限价截断桶",它反映的是薄簿+价差,不是策略容量。 */
   fillAvail: {
     avgPrice: number;
     worstPrice: number;
     shares: number;
     usd: number;
     fills: ExecFill[];
+    /** 没吃满 MIN_EXEC_USD(原义不变,深度不足或被天花板截断都会置真)。 */
     capped: boolean;
+    /** walk 被限价天花板截断(簿子里还有更贵的档位没吃)——与"簿子见底"的
+     * 深度不足区分,两者在事后分层里意义不同。 */
+    limitCapped: boolean;
+    /** 本次 walk 实际使用的价格上界 = limitPriceFor(bestAsk, declarative, cfg)
+     * = 实盘该腿此刻会挂的限价。落库留痕,便于事后按当时的带宽与子类口径复算
+     * (env 或 declarative 判定改过就不能用当前值反推)。 */
+    ceiling: number;
   } | null;
   endDate: string | null;
   /** Gamma 事件 ID(同一事件下的兄弟腿共享)。用于执行侧的同事件聚合敞口帽:
@@ -95,6 +181,30 @@ export interface ExecCheck {
   negRisk: boolean;
   feesEnabled: boolean | null;
   feeRate: number | null;
+}
+
+/** 模拟市价买单沿 asks(须已按价升序)逐档吃单。usdBudget 用尽、簿子见底、
+ * 或档位价超过 ceiling 三者任一即停。ceiling=Infinity 表示不设限价 ——
+ * fill100 走这一路,取值与语义一律不动(它是回测"真可执行"口径的锚)。 */
+function walkAsks(
+  asks: Array<{ price: number; size: number }>,
+  usdBudget: number,
+  ceiling: number
+): { shares: number; cost: number; fills: ExecFill[] } {
+  let usdLeft = usdBudget;
+  let shares = 0;
+  let cost = 0;
+  const fills: ExecFill[] = [];
+  for (const l of asks) {
+    if (usdLeft <= 0.01) break;
+    if (l.price > ceiling) break;
+    const take = Math.min(l.size, usdLeft / l.price);
+    fills.push({ price: l.price, size: take, cost: take * l.price });
+    shares += take;
+    cost += take * l.price;
+    usdLeft -= take * l.price;
+  }
+  return { shares, cost, fills };
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
@@ -308,6 +418,12 @@ export async function checkExecutability(input: {
   /** Effective directional stance (regex stance when directional, else the
    * LLM stance) — decides which outcome side to price. */
   stance: string;
+  /** 宣告类裁定(官方文本直接写明结算结果)。只影响 fillAvail 的限价天花板:
+   * 实盘对这个子类按剩余边缩放放宽限价(tradeExecutor 的 declarative 扫单),
+   * 天花板必须跟着放宽,否则 paper 行系统性少记 shares/usd 并误打 limitCapped
+   * (2026-08-02 复查)。默认 false = 普通档绝对滑点带,向后兼容:未传的调用方
+   * 拿到的天花板与第一轮修复逐字一致。 */
+  declarative?: boolean;
 }): Promise<ExecCheck | null> {
   if ((process.env.EXEC_CHECK ?? "").trim().toLowerCase() === "off") return null;
   try {
@@ -353,31 +469,9 @@ export async function checkExecutability(input: {
           if (l.price > ceiling) break;
           askUsdNear += l.price * l.size;
         }
-        // Walk the asks for a simulated $100 market buy.
-        let usdLeft = MIN_EXEC_USD;
-        let shares = 0;
-        let cost = 0;
-        const fills: ExecFill[] = [];
-        for (const l of asks) {
-          if (usdLeft <= 0.01) break;
-          const take = Math.min(l.size, usdLeft / l.price);
-          fills.push({ price: l.price, size: take, cost: take * l.price });
-          shares += take;
-          cost += take * l.price;
-          usdLeft -= take * l.price;
-        }
-        // 尽力口径:同一次 walk 的结果,只是不要求走满 $100。深度不足时
-        // capped=true,登记侧据此分桶(薄簿样本不与足额样本混算均值)。
-        if (shares > 0) {
-          fillAvail = {
-            avgPrice: cost / shares,
-            worstPrice: fills[fills.length - 1].price,
-            shares,
-            usd: cost,
-            fills,
-            capped: cost < MIN_EXEC_USD - 0.01,
-          };
-        }
+        // Walk the asks for a simulated $100 market buy(不设限价 —— 回测锚
+        // 口径,取值与语义与本批之前完全一致)。
+        const { shares, cost, fills } = walkAsks(asks, MIN_EXEC_USD, Infinity);
         if (cost >= MIN_EXEC_USD - 0.01 && shares > 0) {
           fill100 = {
             avgPrice: cost / shares,
@@ -385,6 +479,31 @@ export async function checkExecutability(input: {
             shares,
             usd: cost,
             fills,
+          };
+        }
+        // 尽力口径(2026-08-02 审计 finding 4):独立走一次带限价天花板的
+        // walk。此前它复用上面那次无上界的 walk,薄簿场景会把远高于实盘限价帽
+        // 的档位算进 avgPrice(0.66 三股 + 0.95 两百股 → 0.92,而实盘限价只有
+        // 0.69),登记进 paper 池 = 系统性低估策略收益率。
+        // 08-02 复查:天花板改成直接调实盘那支 limitPriceFor —— 第一轮自己写的
+        // bestAsk+EXEC_SLIPPAGE 对宣告档窄了最多 0.09(ask 0.20 处 0.23 vs 0.32),
+        // 偏差方向是把 paper 池美化成"入场价优于实盘"。
+        const fillCeiling = limitPriceFor(bestAsk, input.declarative === true, ceilingConfig());
+        const avail = walkAsks(asks, MIN_EXEC_USD, fillCeiling);
+        if (avail.shares > 0) {
+          const availCapped = avail.cost < MIN_EXEC_USD - 0.01;
+          fillAvail = {
+            avgPrice: avail.cost / avail.shares,
+            worstPrice: avail.fills[avail.fills.length - 1].price,
+            shares: avail.shares,
+            usd: avail.cost,
+            fills: avail.fills,
+            capped: availCapped,
+            // 被天花板截断 ⇔ 没吃满 $100 且簿子里还有更贵的档位没吃(asks 已
+            // 升序,故末档超天花板即等价于"存在被截断的档位")。深度不足与
+            // 限价截断在事后分层里意义不同,见 ExecCheck.fillAvail 的分桶说明。
+            limitCapped: availCapped && asks[asks.length - 1].price > fillCeiling,
+            ceiling: fillCeiling,
           };
         }
       }
