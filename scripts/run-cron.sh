@@ -64,6 +64,12 @@ case "$name" in
   chain-watch) RUN_TIMEOUT=170 ;;   # 每 3 分钟一轮,留 10s 余量
   scan-notify) RUN_TIMEOUT=1500 ;;  # 每 30 分钟一轮,单轮正常 ~45s
   heartbeat)   RUN_TIMEOUT=540 ;;    # 每 10 分钟一轮
+  # 值守型长跑(2026-08-05):不是 cron 轮次,而是蹲一个定时数据发布窗口的
+  # 常驻进程,自己用 --max-hours 收尾。默认 300s 会把它们在发布前几小时
+  # 静默杀掉 —— release-watch 首次上线就踩了(4分50秒被 SIGTERM,日志里
+  # 只留一行 WARN,而外部看上去"进程起来了")。给 12h,始终大于脚本自身
+  # 的 --max-hours,让收尾逻辑(留痕+收尾邮件)有机会跑完。
+  release-watch|release-sniper) RUN_TIMEOUT=43200 ;;
   *)           RUN_TIMEOUT=300 ;;
 esac
 timeout -k 30 "$RUN_TIMEOUT" "$TSX_BIN" "$@"
