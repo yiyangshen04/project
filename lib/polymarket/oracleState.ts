@@ -1,4 +1,5 @@
 import type { Opportunity, OracleResolutionState } from "../types";
+import { rpcPostJson } from "./rpcTransport";
 
 interface QuestionData {
   requestTimestamp: bigint;
@@ -126,30 +127,16 @@ export async function ethCall(to: string, data: string, budgetMs?: number): Prom
       if (perUrlMs < 300) break; // 预算耗尽:剩余 URL 不再尝试,抛最后错误
     }
     try {
-      // AbortSignal.timeout bounds the whole call (headers AND body). Without
-      // it, a proxy black-hole (connection established, no response) would
-      // hang each endpoint up to undici's ~300s default — and with several
-      // serial ethCalls per disputed market that stalls the entire scan tick
-      // long enough for flock to skip the next cron round.
-      const res = await fetch(rpc, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "eth_call",
-          params: [{ to, data }, "latest"],
-        }),
-        signal: AbortSignal.timeout(perUrlMs),
+      // rpcPostJson 先走代理再落直连(2026-08-07)。perUrlMs 是这个端点的**总**
+      // 预算,两条路共享 —— 预算算术因此完全不变,而黑洞防护还在:传输层的
+      // 总闸覆盖连接/TLS/响应体全程,不会退回 undici ~300s 默认值。
+      const result = await rpcPostJson<string>(rpc, "eth_call", [{ to, data }, "latest"], {
+        timeoutMs: perUrlMs,
       });
-      const json = (await res.json()) as {
-        result?: string;
-        error?: { message?: string };
-      };
-      if (json.error || !json.result) {
-        throw new Error(json.error?.message ?? "empty eth_call result");
-      }
-      return json.result;
+      // 传输层只判 result === undefined;这里保留原有的更严判据 —— 空串是
+      // 端点没真答上来,应换下一路,而不是当成"合法的空返回"往下游送。
+      if (!result) throw new Error("empty eth_call result");
+      return result;
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
     }

@@ -1,6 +1,7 @@
 import type { GammaMarket } from "../types";
 import type { PolymarketClient } from "./client";
 import { guardHeadJump } from "./headGuard";
+import { rpcPostJson } from "./rpcTransport";
 
 /**
  * Incremental on-chain event sweep for the dispute-flow class.
@@ -86,23 +87,11 @@ async function rpcRequestVia<T>(urls: string[], method: string, params: unknown[
   let lastError: Error | null = null;
   for (const rpc of urls) {
     try {
-      // AbortSignal.timeout covers the body read too — a plain
-      // controller+clearTimeout fires as soon as headers arrive, so a
-      // slow-drip response could hang res.json() up to undici's ~300s default.
-      const res = await fetch(rpc, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-        signal: AbortSignal.timeout(15_000),
-      });
-      const json = (await res.json()) as {
-        result?: T;
-        error?: { message?: string };
-      };
-      if (json.error || json.result === undefined) {
-        throw new Error(json.error?.message ?? `empty ${method} result`);
-      }
-      return json.result;
+      // rpcPostJson: 每个端点先走代理再落直连(2026-08-07 实测:直连出口 CN,
+      // 高峰期 TLS 握手随机耗时数秒,成功率 67–73%;走代理 96/96 且 116–461ms)。
+      // 超时口径不变 —— 传输层内部对两条路各自计时,且总闸覆盖响应体读取,
+      // 不会退回 undici ~300s 默认值。
+      return await rpcPostJson<T>(rpc, method, params);
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
     }

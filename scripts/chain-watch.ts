@@ -69,6 +69,7 @@ import { priorityOf as tierOf, isGreen, isFatTailShape, type TierVerdict } from 
 import { isDirectionalStance } from "../lib/virtualTags";
 import { KNOWN_ADAPTERS } from "../lib/polymarket/onchainEvents";
 import { guardHeadJump } from "../lib/polymarket/headGuard";
+import { rpcPostJson } from "../lib/polymarket/rpcTransport";
 import { writeFileAtomic } from "../lib/fsAtomic";
 
 /** Full HTML entity escape for any chain-sourced string spliced into email
@@ -254,21 +255,11 @@ async function rpcVia<T>(urls: string[], method: string, params: unknown[]): Pro
   let lastError: Error | null = null;
   for (const url of urls) {
     try {
-      // AbortSignal.timeout covers the WHOLE request including the body read —
-      // a plain controller+clearTimeout would fire clearTimeout right after the
-      // headers arrive, leaving res.json() to hang up to undici's ~300s default
-      // on a slow-drip RPC and stalling the whole tick past its cron slot.
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-        signal: AbortSignal.timeout(15_000),
-      });
-      const json = (await res.json()) as { result?: T; error?: { message?: string } };
-      if (json.error || json.result === undefined) {
-        throw new Error(json.error?.message ?? `empty ${method} result`);
-      }
-      return json.result;
+      // rpcPostJson: 每个端点先代理后直连(2026-08-07)。冗余从 4 路变 8 路,
+      // 且不再受 run-cron.sh 那份 NO_PROXY 名单摆布。代理整体挂掉时传输层
+      // 内部会熔断(连续 2 次失败后 60s 内跳过),避免每个端点白等满超时 ——
+      // 本 tick 的预算只有 TICK_KILL_MS。总闸仍覆盖响应体读取。
+      return await rpcPostJson<T>(url, method, params);
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
     }
