@@ -199,6 +199,24 @@ const REFILL_MAX_TRIES = Number(process.env.CHAIN_WATCH_REFILL_MAX_TRIES) || 4;
 /** 单 tick 最多复访几个 token(预算保护:复访排在新信号之后)。 */
 const REFILL_MAX_PER_TICK = 4;
 
+/** 本脚本自己的入场价上限(2026-08-06 补)。
+ *
+ * 病灶:EXEC_MAX_PRICE 是全进程共享的 env,08-06 为 release-sniper 的 CSU 尾价区
+ * 补仓从 0.97 抬到 0.995 —— chain-watch 一行代码没改,却在 13.7 小时里多出了
+ * freshAsk ∈ (0.97, 0.995] 这一整类可成交腿。它的执行路径上此前**没有任何独立
+ * 价格上限**:通知侧那个 `bestAsk < 0.97`(§漏斗)只是 🔵 档降噪过滤器,不在
+ * 执行链上。
+ *
+ * 于是这里钉一道只属于 chain-watch 的帽,默认 0.97 = 抬高前的历史行为。它与
+ * EXEC_MAX_PRICE 取 min(executeSignal 侧只收紧不放宽),要放开必须显式配
+ * CHAIN_WATCH_MAX_ASK —— 别处再调 env 不会波及争议/澄清事件流。
+ *
+ * 为什么两条管线该有不同的帽:sniper 打的是"官方数字已落地、结果已确定"的
+ * 秒级窗口,0.99 档买的是几分钟后的 $1;chain-watch 打的是争议/澄清流,同样
+ * 的 0.99 只意味着市场早已定价完毕、我们在为 0.5–1 分的残值承担 100% 的判错
+ * 风险(bt3:🟢双确认仍有 7 笔 −100% 级的边界澄清误读)。 */
+const CHAIN_MAX_ASK = Number(process.env.CHAIN_WATCH_MAX_ASK) || 0.97;
+
 /** 预埋名单上限。bt5 实测 15 个月 80 个市场,批量裁定日一次可预埋数十个姊妹市场。 */
 const PREARM_MAX = 80;
 /** 承诺时点前多早进入快轮询。官方偶有提前 1-2 分钟落文本。 */
@@ -659,7 +677,12 @@ async function main(): Promise<void> {
         max_order_usd: ec.maxOrderUsd,
         daily_max_usd: ec.dailyMaxUsd,
         total_max_usd: ec.totalMaxUsd,
+        // price_band 记 env 口径(EXEC_MAX_PRICE),eff_price_band 记本脚本
+        // 实际生效的帽(与 CHAIN_WATCH_MAX_ASK 取 min)。08-06 那次 0.995 之所以
+        // 能在生产里跑 13.7 小时没人看见,正是因为日志里只有 env 那一半 ——
+        // 两个口径都落,下次翻日志一眼能分出"谁抬的"和"实际吃到哪"。
         price_band: [ec.minPrice, ec.maxPrice],
+        eff_price_band: [ec.minPrice, Math.min(ec.maxPrice, CHAIN_MAX_ASK)],
         slippage: ec.slippage,
         loss_halt_count: ec.lossHaltCount,
         forecast_live: ec.forecastLive || undefined,
@@ -1863,6 +1886,8 @@ async function main(): Promise<void> {
         feeRate: e.feeRate,
         forecastTemplate: n.forecastTemplate === true,
         correction: n.correction === true,
+        // 独立价格帽:与 EXEC_MAX_PRICE 取 min,别处抬 env 不再波及本管线。
+        maxPriceCap: CHAIN_MAX_ASK,
         budgetMs: wallBudgetLeftMs(),
       });
       // 成交即进补仓复访名单(2026-08-02):卖家补货不会重新触发信号,引擎
@@ -1990,6 +2015,9 @@ async function main(): Promise<void> {
           feesEnabled: r.feesEnabled,
           feeRate: r.feeRate,
           forecastTemplate: r.forecastTemplate,
+          // 补仓走同一道帽:复访时价格往往已被跟随者抬高,这里正是最容易
+          // 摸到 (0.97, 0.995] 的路径。
+          maxPriceCap: CHAIN_MAX_ASK,
           budgetMs: wallBudgetLeftMs(),
         });
         const at = new Date().toISOString();

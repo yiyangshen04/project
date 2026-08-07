@@ -94,7 +94,7 @@ function ceilingConfig(): LimitBandConfig {
   return {
     slippage: envNum("EXEC_SLIPPAGE", 0.03),
     slippageEdgeFrac: envNum("EXEC_SLIPPAGE_EDGE_FRAC", 0.15),
-    maxPrice: envNum("EXEC_MAX_PRICE", 0.97),
+    maxPrice: envNum("EXEC_MAX_PRICE", 0.995),
   };
 }
 
@@ -139,8 +139,8 @@ export interface ExecCheck {
    * 该腿的限价本身(宣告档按剩余边缩放,不再被普通档的绝对滑点带压窄)。
    * 常规价位下天花板 ≥ bestAsk,最优档永远在内,登记死锁不会因此复发;例外只有
    * 两种,且都是实盘同样吃不到的形态,fillAvail=null 是正确镜像:
-   *  · bestAsk > EXEC_MAX_PRICE(默认 0.97)—— 实盘走"ask > 上限(尾价/已重定价)"
-   *    直接 skip;
+   *  · bestAsk > EXEC_MAX_PRICE(默认 0.995,2026-08-06 从 0.97 抬高)—— 实盘走
+   *    "ask > 上限(尾价/已重定价)"直接 skip;
    *  · 显式把 EXEC_SLIPPAGE 与 EXEC_SLIPPAGE_EDGE_FRAC 都配成 0 —— 带宽归零后
    *    round(ask×100)/100 可能落在 ask 之下(0.664→0.66),实盘同样因"限价内深度
    *    为 0"skip。

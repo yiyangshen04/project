@@ -27,7 +27,14 @@
  *   EXEC_TOTAL_MAX_USD   default 400  (当前未结算持仓上限;已结算市场经 Gamma
  *                        核销释放,缓存于 ledger 同目录 trade-settled.json)
  *   EXEC_MIN_ORDER_USD   default 5    (低于此值不值得付固定成本)
- *   EXEC_MAX_PRICE       default 0.97 (入场价上限;≥0.97 是尾价 carry,自动模式不吃)
+ *   EXEC_MAX_PRICE       default 0.995(入场价上限。2026-08-06 从 0.97 抬到 0.995:
+ *                        0.97 挡掉的不是垃圾而是整个尾价 carry 类 —— 尘档货基
+ *                        (0.95-0.99 买近确定盘)、结算已定未提案的收尾仓、宣告后
+ *                        0.97-0.99 的扫尾档,全平台实测翻车率 1.02%(非天气子样本
+ *                        0/127)使这一带在 ≤0.99 处仍为正 EV。盈亏平衡点在 0.990
+ *                        附近(毛 1.01% vs 翻车 1.02%),0.99 以上要靠负面清单把
+ *                        翻车压到 <0.5% 才成立 —— 闸门放到 0.995 是把这个判断交给
+ *                        选盘,不再由执行器一刀切)
  *   EXEC_MIN_PRICE       default 0.15 (入场价下限;bt4 定量:0.03-0.15 彩票区
  *                        历史 4/4 归零、真肥尾入场价均 ≥0.15。这同时是 M2 极端
  *                        逆共识红旗(注解时刻 ask<0.15)在执行侧的地板 —— 原默认
@@ -133,6 +140,12 @@ export interface TradeSignalInput {
   feeRate?: number | null;
   forecastTemplate?: boolean;
   correction?: boolean;
+  /** 调用方自带的价格上限(2026-08-06)。EXEC_MAX_PRICE 是全进程共享的 env,
+   * 为某一条管线的需要抬高它,其余管线会被动继承——0.995 那次抬高就是为
+   * release-sniper 的尾价区补仓,而 chain-watch 什么都没改就多出了
+   * freshAsk ∈ (0.97, 0.995] 这一整类新腿。此字段让每条管线钉住自己的帽:
+   * 与 cfg.maxPrice 取 min,只能收紧、永远不能放宽(放宽仍须显式改 env)。 */
+  maxPriceCap?: number | null;
   /** 本 tick 剩余墙钟预算;不足则跳过,绝不拖垮告警路径。 */
   budgetMs: number;
   /** selftest/probe 专用:ledger 记录带 probe 标记,不参与去重与额度累计。 */
@@ -204,7 +217,7 @@ export function execConfig() {
      * 3×maxOrder;判错时连亏熔断的"3 笔缓冲"在家族相关性下退化为 1 次判断。 */
     perEventMaxUsd: num("EXEC_PER_EVENT_MAX_USD", 2 * num("EXEC_MAX_ORDER_USD", 50)),
     minOrderUsd: num("EXEC_MIN_ORDER_USD", 5),
-    maxPrice: num("EXEC_MAX_PRICE", 0.97),
+    maxPrice: num("EXEC_MAX_PRICE", 0.995),
     minPrice: num("EXEC_MIN_PRICE", 0.15),
     slippage: num("EXEC_SLIPPAGE", 0.03),
     slippageEdgeFrac: num("EXEC_SLIPPAGE_EDGE_FRAC", 0.15),
@@ -671,10 +684,27 @@ export function markSettlementsNotified(conditionIds: string[]): void {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let clientPromise: Promise<any> | null = null;
 
+/** 测试注入点(2026-08-06)。executeSignal 的价格帽、深度闸、漂移带全部落在
+ * getOrderBook 之后,而 client init 需要真钱包 —— 于是所有闸门的**行为**此前
+ * 都测不到,测试只能停在"缺钱包 error",断言接缝一律退化到纯函数边界。
+ * 08-06 EXEC_MAX_PRICE 0.97→0.995 就是这么带着一整类新腿进的生产:
+ * 96/96 全绿,而"哪些 ask 从 skip 变成可成交"没有一条断言看得见。
+ * 生产路径恒为 null(只有 tests 调用 setter),不引入任何运行时分支代价。 */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let clientOverride: any = null;
+
+/** 仅供 tests 使用:注入一个假 CLOB client(传 null 复位)。 */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function __setExecClientForTest(client: any | null): void {
+  clientOverride = client;
+  clientPromise = null;
+}
+
 /** 已配置三元组(signer/funder/POLY_1271)与缓存 L2 creds 的 CLOB client。
  * 供 executeSignal 与 exec-selftest 共用;失败不缓存,下次调用重试。 */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export async function getExecClient(): Promise<any> {
+  if (clientOverride) return clientOverride;
   if (clientPromise) return clientPromise;
   clientPromise = (async () => {
     const cfg = execConfig();
@@ -737,7 +767,19 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
  */
 export async function executeSignal(input: TradeSignalInput): Promise<TradeAttempt> {
   const t0 = Date.now();
-  const cfg = execConfig();
+  // 调用方帽只收紧不放宽(见 TradeSignalInput.maxPriceCap)。非法值(NaN/负数/
+  // 0)当没传:一个手滑的 0 会把整条管线静默锁死,而"限价帽被配成 0"这种事
+  // 没有任何告警接缝能发现。
+  const baseCfg = execConfig();
+  const callerCap =
+    input.maxPriceCap != null && Number.isFinite(input.maxPriceCap) && input.maxPriceCap > 0
+      ? input.maxPriceCap
+      : null;
+  const cfg =
+    callerCap != null && callerCap < baseCfg.maxPrice
+      ? { ...baseCfg, maxPrice: callerCap }
+      : baseCfg;
+  const capSource = cfg.maxPrice === baseCfg.maxPrice ? "EXEC_MAX_PRICE" : "调用方帽";
   const mode = executionMode();
   /** live 路径下单前置位;此后所有终态行(含 catch 兜底)带同一 attemptId,
    * 在 readLedger 处取代 write-ahead intent 行。 */
@@ -1071,7 +1113,7 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
       return finish({
         mode,
         status: "skipped",
-        reason: `ask ${freshAsk.toFixed(3)} > 上限 ${cfg.maxPrice}(尾价/已重定价)`,
+        reason: `ask ${freshAsk.toFixed(3)} > 上限 ${cfg.maxPrice}(${capSource};尾价/已重定价)`,
         freshAsk,
       });
     }

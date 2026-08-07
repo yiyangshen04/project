@@ -50,12 +50,19 @@ export const upDriftBand = (signalAsk: number, slippage: number, edgeFrac: numbe
  * 0.5 + max(0.03, 0.15×0.5) = 0.575,而 0.575×100 在双精度下是 57.4999…,
  * Math.round 落到 57 → 0.57。方向是"少付一个 tick"(保守),刻意不改 ——
  * 改成向上取整会在所有现存路径上普涨限价(tests/tradeExecutor.test.ts 按
- * 0.57 锁死这条边界)。 */
+ * 0.57 锁死这条边界)。
+ *
+ * 2026-08-06:第三个钳位原为硬编码 0.99,与 EXEC_MAX_PRICE 各管一半 —— 闸门抬到
+ * 0.995 后它会把限价压回 0.99,使 ask∈(0.99, 0.995] 的腿"过得了闸、成不了交"
+ * (限价低于最优 ask,FAK 立即全撤)。策略上限归 cfg.maxPrice 单一控制,这里只留
+ * 协议上限 0.999(CLOB 最高有效报价,≥1.0 会被拒单)。 */
+const CLOB_MAX_TICK = 0.999;
+
 export const limitPriceFor = (
   freshAsk: number,
   declarative: boolean,
   cfg: LimitBandConfig
 ): number => {
   const band = declarative ? upDriftBand(freshAsk, cfg.slippage, cfg.slippageEdgeFrac) : cfg.slippage;
-  return Math.min(Math.round((freshAsk + band) * 100) / 100, cfg.maxPrice, 0.99);
+  return Math.min(Math.round((freshAsk + band) * 100) / 100, cfg.maxPrice, CLOB_MAX_TICK);
 };

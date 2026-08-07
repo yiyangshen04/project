@@ -74,6 +74,21 @@
  *   · --max-price  超过就不买(默认 0.90)。bot 若已把价推到 0.97,那笔
  *                  边际只剩 3%,不值得为它承担解析风险 —— 放弃是正确答案。
  *
+ * ── --max-price 到底封住了什么(2026-08-07 核验修订)────────────
+ * 它是一道**追高闸**,不是"成交均价上限"。旧文档把它压缩成"价格上限",
+ * 那句话在生产上是假的:它硬 return 的判据是**下单前那一刻的 ask**,而
+ * executeSignal 会在自己那一侧重拉一次盘口(freshAsk),再在 freshAsk 之上
+ * 按滑点带算出 limitPrice —— 两者都可以高过 --max-price。
+ * EXEC_MAX_PRICE 从 0.97 抬到 0.995 之后,最坏路径由 +2.0 分变成 +4.5 分。
+ *
+ * 修法不能是"把 EXEC_MAX_PRICE 钉成 --max-price":实测
+ * limitPriceFor(0.95, declarative, {maxPrice: 0.95}) = 0.95 = freshAsk 本身
+ * → 滑点带归零,FAK 只能吃簿顶那一档;ledger #108 那 $44 的绝大部分来自
+ * 0.95 以上的档位,那么钉等于把成交量砍掉。
+ * 所以钉的是 **--max-price + 滑点带**(maxPriceCap,只收紧不放宽):
+ * 最坏成交价 = --max-price + EXEC_SLIPPAGE,语义写得出、算得准,滑点带
+ * 完整保留。成交后再对 avgPrice 做一次事后核对,超了就告警留痕。
+ *
  * ── 补仓(2026-08-02 那批的复访语义,这里按秒级窗口重调)────────
  * 第一笔成交后,卖家/bot 补货不会再触发任何信号,引擎必须自己回头看。
  * 成交即进本进程内的复访循环,每 --refill-every 秒重试一次,共
@@ -93,7 +108,8 @@
  * 参数:
  *   --event <id>          Gamma event id(CSU 家族 = 773492)
  *   --usd <金额>          单笔名义额,默认 30
- *   --max-price <价>      买入价上限,默认 0.90(高于此价放弃,不追高)
+ *   --max-price <价>      追高闸,默认 0.90:信号时刻 ask 高于此价即放弃。
+ *                         最坏成交价 = 此价 + EXEC_SLIPPAGE(见上文修订说明)
  *   --arm                 实弹开关。不给 = 全程 dry,只演不买
  *   --simulate <数字>     跳过等待,假装解析到该数字(自检用;仍受 --arm 约束)
  *   --refill-tries <次>   成交后补仓重试次数,默认 8
@@ -125,6 +141,16 @@ const num = (n: string, d: number): number => {
 const EVENT_ID = arg("--event") ?? "773492";
 const USD = num("--usd", 30);
 const MAX_PRICE = num("--max-price", 0.9);
+/** --max-price 之上还允许的滑点带 = executeSignal 会用的那一条(默认 0.03)。
+ * 执行侧的帽钉在 MAX_PRICE + 这一条:既守住"最坏成交价说得出口"的纪律,
+ * 又不像直接钉 MAX_PRICE 那样把滑点带压成 0(那会让 FAK 只吃簿顶一档)。 */
+const EXEC_SLIPPAGE = (() => {
+  const v = Number(process.env.EXEC_SLIPPAGE);
+  return Number.isFinite(v) && v >= 0 ? v : 0.03;
+})();
+/** 传给 executeSignal 的独立价格帽。它同时封住 freshAsk 与 limitPrice ——
+ * --max-price 那道硬 return 只封得住信号时刻的 ask。 */
+const EXEC_PRICE_CAP = Math.min(0.999, MAX_PRICE + EXEC_SLIPPAGE);
 const ARMED = argv.includes("--arm");
 const SIMULATE = arg("--simulate") != null ? Number(arg("--simulate")) : null;
 const REFILL_TRIES = num("--refill-tries", 8);
@@ -460,6 +486,9 @@ async function fireOnce(leg: Leg, value: number, tag: string): Promise<TradeAtte
     feesEnabled: leg.feesEnabled,
     feeRate: leg.feeRate,
     forecastTemplate: false,
+    // 追高闸只封信号时刻的 ask;这道帽把 freshAsk 与 limitPrice 一并封在
+    // --max-price + 滑点带之内(只收紧不放宽,EXEC_MAX_PRICE 更严时以它为准)。
+    maxPriceCap: EXEC_PRICE_CAP,
     budgetMs: 120_000,
   });
   emit({
@@ -467,12 +496,28 @@ async function fireOnce(leg: Leg, value: number, tag: string): Promise<TradeAtte
     tag,
     leg: leg.short,
     ask,
+    priceCap: EXEC_PRICE_CAP,
     status: attempt.status,
     reason: attempt.reason,
     filledUsd: attempt.filledUsd,
     avgPrice: attempt.avgPrice,
     orderId: attempt.orderId,
   });
+  // 成交均价事后核对(2026-08-07):限价封的是**最坏**成交价,均价是限价以下
+  // 扫到哪算哪的加权值(ledger #108:limit 0.97 / avg 0.961)。均价越过
+  // --max-price 不代表下单错了 —— 代表这个参数的直觉含义与实际行为分了岔,
+  // 必须在当场留下一行,而不是等下一次审计从 ledger 里考古出来。
+  if (attempt.avgPrice != null && attempt.avgPrice > MAX_PRICE) {
+    emit({
+      kind: "avg-price-over-cap",
+      leg: leg.short,
+      tag,
+      avgPrice: attempt.avgPrice,
+      maxPrice: MAX_PRICE,
+      limitPrice: attempt.limitPrice,
+      note: "--max-price 是追高闸(封信号时刻 ask),不是成交均价上限",
+    });
+  }
   return attempt;
 }
 
@@ -484,7 +529,7 @@ async function fireAndRefill(leg: Leg, value: number): Promise<void> {
       `<p>市场:${leg.question}</p>` +
       `<p>结果:<b>${first?.status ?? "未发起"}</b> ${first?.reason ?? ""}</p>` +
       `<p>成交:$${first?.filledUsd ?? 0} @ ${first?.avgPrice ?? "—"}</p>` +
-      `<p>模式:${ARMED ? "实弹" : "DRY(未开 --arm)"} · 单笔上限 $${USD} · 价格上限 ${MAX_PRICE}</p>`
+      `<p>模式:${ARMED ? "实弹" : "DRY(未开 --arm)"} · 单笔上限 $${USD} · 追高闸 ${MAX_PRICE}(最坏成交价 ${EXEC_PRICE_CAP.toFixed(3)})</p>`
   );
 
   // 补仓复访:卖家/bot 补货不会再触发任何信号,只能自己回头看。每轮都完整
@@ -512,6 +557,7 @@ async function main(): Promise<void> {
     eventId: EVENT_ID,
     usd: USD,
     maxPrice: MAX_PRICE,
+    execPriceCap: EXEC_PRICE_CAP,
     armed: ARMED,
     envExecMode: executionMode(),
     simulate: SIMULATE,
@@ -580,7 +626,7 @@ async function main(): Promise<void> {
   });
   await notify(
     "🔫 release-sniper 已上岗",
-    `<p>模式:<b>${ARMED ? "实弹" : "DRY"}</b> · 单笔 $${USD} · 价格上限 ${MAX_PRICE}</p>` +
+    `<p>模式:<b>${ARMED ? "实弹" : "DRY"}</b> · 单笔 $${USD} · 追高闸 ${MAX_PRICE}(最坏成交价 ${EXEC_PRICE_CAP.toFixed(3)})</p>` +
       `<p>基线:Last-Modified=${baselineLastModified} · 当前数字=${baselineValue}</p>` +
       `<p>三重确认(PDF 200 ∧ 首页已刷新 ∧ 数字双读一致)全部满足才下单。</p>` +
       `<p>轮询:${headFast ? `HEAD 快路(${POLL_COLD_MS / 1000}s / 热 ${POLL_HOT_MS / 1000}s)` : "每轮 GET 全页(HEAD 不可信,已退回)"}` +

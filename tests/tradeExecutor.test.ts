@@ -183,7 +183,7 @@ test("lossHaltTripped:尾亏达阈值触发;水位之后无新亏损不重复熔
 // 重放 15 个月:三闸门 16 笔全胜 +$194,无闸裸执行 −$195(快照雷全踩)。
 // 闸门全部在任何网络调用之前,可离线断言;EXEC_WALLET_JSON 指向不存在路径,
 // 保证"过闸"用例在 client init 处以 error 终止,绝不触网。
-import { executeSignal } from "../lib/polymarket/tradeExecutor";
+import { executeSignal, __setExecClientForTest } from "../lib/polymarket/tradeExecutor";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -326,13 +326,132 @@ test("限价帽:普通 🟢 用绝对滑点带,宣告类按边缩放放宽", () 
   // 高价位:边缩放退化回绝对带,两者一致(只放宽低价位,绝不收紧既有行为)
   assert.equal(limitPriceFor(0.9, false, cfg), 0.93);
   assert.equal(limitPriceFor(0.9, true, cfg), 0.93);
-  // maxPrice 与 0.99 硬帽在两种口径下都不被突破
+  // maxPrice 在两种口径下都不被突破
   assert.equal(limitPriceFor(0.96, true, cfg), 0.97);
   // 0.5 + max(0.03, 0.15×0.5=0.075) = 0.575,但 0.575×100 在双精度下是
   // 57.4999…,Math.round 落到 57 → 0.57。这是既有 round(x*100)/100 惯用法的
   // 浮点边界,方向是"少付一个 tick"(保守),刻意不改:改成向上取整会在所有
   // 现存路径上普涨限价。
   assert.equal(limitPriceFor(0.5, true, { ...cfg, maxPrice: 0.99 }), 0.57);
+});
+
+test("限价帽 2026-08-06:尾价区不再被 0.99 硬帽压成不可成交", () => {
+  // 闸门抬到 0.995 后,原先那个与 maxPrice 并列的 0.99 硬编码会让 ask∈(0.99,0.995]
+  // 的腿"过得了闸、成不了交"——限价 0.99 低于最优 ask,marketable-limit FAK 立即
+  // 全撤。这条钉死:限价必须 ≥ 该腿的 ask,否则闸门抬高等于白抬。
+  const cfg = { slippage: 0.03, slippageEdgeFrac: 0.15, maxPrice: 0.995 };
+  for (const ask of [0.986, 0.99, 0.992, 0.995]) {
+    const lp = limitPriceFor(ask, false, cfg);
+    assert.ok(lp >= ask, `ask ${ask} 的限价 ${lp} 低于 ask,FAK 不可能成交`);
+    assert.ok(lp <= cfg.maxPrice, `ask ${ask} 的限价 ${lp} 突破了 maxPrice`);
+  }
+  // 协议上限仍在:maxPrice 配到 1 以上也不会报出 ≥1.0 的价(CLOB 会拒单)
+  assert.equal(limitPriceFor(0.999, false, { ...cfg, maxPrice: 1.5 }), 0.999);
+  // 旧默认 0.97 的行为不因本次改动漂移(显式传 cfg 的调用方不受影响)
+  assert.equal(limitPriceFor(0.96, false, { ...cfg, maxPrice: 0.97 }), 0.97);
+});
+
+// ── 价格帽的行为接缝(2026-08-07)──
+// 上面两条只锁 limitPriceFor 的纯函数边界。08-06 那次 0.97→0.995 真正改掉的
+// 行为是「freshAsk ∈ (0.97, 0.995] 的腿从一律 skip 变成可成交」,而它落在
+// executeSignal 的 getOrderBook 之后 —— 没有假 client 就一条都断言不到,
+// 于是 96/96 全绿而变更本身没被测过。__setExecClientForTest 补上这道接缝。
+
+/** 只提供 executeSignal 在 dry 路径上用到的两个方法。 */
+function fakeClient(asks: Array<{ price: string; size: string }>) {
+  const calls: Array<{ price: number; amount: number }> = [];
+  return {
+    calls,
+    getOrderBook: async () => ({ asks }),
+    createMarketOrder: async (o: { price: number; amount: number }) => {
+      calls.push({ price: o.price, amount: o.amount });
+      return { salt: "1", signature: "0x" };
+    },
+  };
+}
+
+/** 尾价区一档足量的簿:$400 供给,不会撞上 minOrderUsd/深度闸。 */
+const tailBook = (ask: number) => [{ price: String(ask), size: String(Math.ceil(400 / ask)) }];
+
+test("价格帽行为:0.97→0.995 让 freshAsk∈(0.97,0.995] 从 skip 变可成交", async () => {
+  const client = fakeClient(tailBook(0.98));
+  __setExecClientForTest(client);
+  try {
+    // 抬高前:0.98 撞帽,skip(这是 08-06 之前生产上唯一会发生的事)
+    const before = await execWith(
+      { EXEC_MODE: "dry", EXEC_MAX_PRICE: "0.97" },
+      { bestAskAtSignal: 0.98, forecastTemplate: false }
+    );
+    assert.equal(before.status, "skipped");
+    assert.match(before.reason ?? "", /> 上限 0\.97/);
+    assert.match(before.reason ?? "", /EXEC_MAX_PRICE/);
+
+    // 抬高后:同一条腿过闸并真的构出单,限价 ≥ ask(否则 FAK 必然全撤)
+    const after = await execWith(
+      { EXEC_MODE: "dry", EXEC_MAX_PRICE: "0.995" },
+      { bestAskAtSignal: 0.98, forecastTemplate: false }
+    );
+    assert.equal(after.status, "dry");
+    assert.equal(after.freshAsk, 0.98);
+    assert.ok((after.limitPrice ?? 0) >= 0.98, `限价 ${after.limitPrice} 低于 ask 0.98`);
+    assert.ok((after.limitPrice ?? 1) <= 0.995, `限价 ${after.limitPrice} 突破 0.995`);
+    assert.equal(client.calls.length, 1);
+  } finally {
+    __setExecClientForTest(null);
+  }
+});
+
+test("独立价格帽:调用方帽只收紧不放宽,且 skip 理由指出是谁的帽", async () => {
+  const client = fakeClient(tailBook(0.98));
+  __setExecClientForTest(client);
+  try {
+    // chain-watch 口径:env 抬到 0.995,但本管线自钉 0.97 → 仍然 skip
+    const capped = await execWith(
+      { EXEC_MODE: "dry", EXEC_MAX_PRICE: "0.995" },
+      { bestAskAtSignal: 0.98, forecastTemplate: false, maxPriceCap: 0.97 }
+    );
+    assert.equal(capped.status, "skipped");
+    assert.match(capped.reason ?? "", /> 上限 0\.97/);
+    assert.match(capped.reason ?? "", /调用方帽/);
+    assert.equal(client.calls.length, 0);
+
+    // 反向:调用方帽比 env 宽 → 不生效(放宽仍须显式改 env)
+    const wider = await execWith(
+      { EXEC_MODE: "dry", EXEC_MAX_PRICE: "0.97" },
+      { bestAskAtSignal: 0.98, forecastTemplate: false, maxPriceCap: 0.999 }
+    );
+    assert.equal(wider.status, "skipped");
+    assert.match(wider.reason ?? "", /> 上限 0\.97/);
+    assert.match(wider.reason ?? "", /EXEC_MAX_PRICE/);
+
+    // 非法值(0/负数/NaN)当没传,绝不把管线静默锁死
+    for (const bad of [0, -1, Number.NaN]) {
+      const r = await execWith(
+        { EXEC_MODE: "dry", EXEC_MAX_PRICE: "0.995" },
+        { bestAskAtSignal: 0.98, forecastTemplate: false, maxPriceCap: bad }
+      );
+      assert.equal(r.status, "dry", `maxPriceCap=${bad} 不该拦下任何腿`);
+    }
+  } finally {
+    __setExecClientForTest(null);
+  }
+});
+
+test("独立价格帽:帽内的腿照常成交(闸不是把整个尾价区关掉)", async () => {
+  const client = fakeClient(tailBook(0.95));
+  __setExecClientForTest(client);
+  try {
+    const r = await execWith(
+      { EXEC_MODE: "dry", EXEC_MAX_PRICE: "0.995" },
+      { bestAskAtSignal: 0.95, forecastTemplate: false, maxPriceCap: 0.97 }
+    );
+    assert.equal(r.status, "dry");
+    // 0.95 + 0.03 = 0.98,但调用方帽 0.97 同时压住限价(不只是入场闸)
+    assert.equal(r.limitPrice, 0.97);
+    assert.equal(client.calls[0]?.price, 0.97);
+  } finally {
+    __setExecClientForTest(null);
+  }
 });
 
 test("补仓:token 累计敞口未达上限 → 不再二值封锁(可继续加仓)", async () => {

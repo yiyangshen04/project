@@ -357,6 +357,37 @@ async function probeOnce(url: string): Promise<{ status: number | null; contentL
   }
 }
 
+// ── 页面新鲜度(2026-08-07 CSU 复盘)──
+
+/** 数字页的一次快照指纹。
+ *
+ * 病灶:extractLoop 的判据是纯数值比较(`val !== lastVal`),而 CSU 8-05 那次
+ * 首页数字**发布前后都是 9** —— 整整 8 小时 extract 只落了启动那一行,
+ * number-updated 零次,release-watch 对那次发布在结构上只剩 "PDF 200" 一条腿。
+ * 数值比较只在数字**变了**时说话;而"页面换了一版"本身就是发布信号,与新旧
+ * 数字是否相同无关。
+ *
+ * 用去标签后的正文长度而不是 Content-Length:后者被 gzip 协商与页内 nonce
+ * 搅动(08-07 §3.1:Akamai boomerang 每轮注入 ak.rid/ak.t,整页哈希天然不可
+ * 比),去标签后的长度对这类噪音稳健得多。 */
+interface Freshness {
+  lm: string | null;
+  etag: string | null;
+  textLen: number;
+}
+
+/** 与基线比,哪些信号动了。lm/etag 变动无条件算数(源站语义);正文长度设
+ * 1% 门槛 —— 页脚时间戳、轮播计数这类每轮小抖动不该把值守喊起来。 */
+function freshnessMoved(base: Freshness, now: Freshness): string[] {
+  const moved: string[] = [];
+  if (base.lm !== now.lm) moved.push("last-modified");
+  if (base.etag !== now.etag) moved.push("etag");
+  if (base.textLen > 0 && Math.abs(now.textLen - base.textLen) / base.textLen >= 0.01) {
+    moved.push("text-length");
+  }
+  return moved;
+}
+
 async function fetchEvidence(url: string): Promise<void> {
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
@@ -492,12 +523,53 @@ async function main(): Promise<void> {
     const url = HTML_PROBE ?? spec.url;
     const baseline = BASELINE != null ? Number(BASELINE) : null;
     let lastVal: number | null = null;
+    /** 启动那一轮的页面指纹 = 基线(启动时页面必然是"发布前"那一版)。 */
+    let baseFresh: Freshness | null = null;
+    let lastFresh: Freshness | null = null;
+    let freshNotified = false;
     while (!stopping) {
       const roundStart = Date.now();
       try {
         const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
         if (res.ok) {
-          const val = spec.parse(stripHtml(await res.text()));
+          const plain = stripHtml(await res.text());
+          const fresh: Freshness = {
+            lm: res.headers.get("last-modified"),
+            etag: res.headers.get("etag"),
+            textLen: plain.length,
+          };
+          if (baseFresh == null) {
+            baseFresh = fresh;
+            emit({ kind: "page-baseline", url, ...fresh });
+          } else {
+            // 逐轮留痕相对**上一轮**的变动(量小、便于事后重建时间线),
+            // 而告警判据取相对**基线** —— 页面来回抖动不该反复喊人。
+            if (lastFresh && freshnessMoved(lastFresh, fresh).length > 0) {
+              emit({ kind: "page-drift", url, from: lastFresh, to: fresh });
+            }
+            const moved = freshnessMoved(baseFresh, fresh);
+            if (moved.length > 0 && !freshNotified) {
+              freshNotified = true;
+              emit({ kind: "page-updated", url, moved, from: baseFresh, to: fresh });
+              // 与"已发布"同级的争秒信,但明说是弱证据:页面换版≠数字已出,
+              // 也可能是编辑排版。收信人自己开 PDF 比脚本判读快。
+              void notify(
+                `🔶 ${LABEL} 数字页已换版(${moved.join("/")}) — ${new Date().toISOString()}`,
+                `<p><b>页面新鲜度变动:</b> <a href="${url}">${url}</a></p>` +
+                  `<p>变动信号:<b>${moved.join(" / ")}</b><br>` +
+                  `Last-Modified ${baseFresh.lm ?? "—"} → ${fresh.lm ?? "—"}<br>` +
+                  `正文长度 ${baseFresh.textLen} → ${fresh.textLen}</p>` +
+                  `<p style="color:#b45309;font-size:12px">⚠ 这是弱证据:页面换版不等于数字已更新` +
+                  `(CSU 8-05 首页数字发布前后都是 9,纯数值比较整夜零响,故补这条腿)。` +
+                  `以 PDF 与 headline 表原文为准。本脚本不下单。</p>` +
+                  `<p>此刻盘口:</p>` +
+                  bookTableHtml(lastBooks),
+                `${LABEL} 数字页已换版(${moved.join("/")}): ${url}`
+              );
+            }
+          }
+          lastFresh = fresh;
+          const val = spec.parse(plain);
           if (val !== lastVal) {
             emit({ kind: "extract", url, value: val, baseline, rule: EXTRACT, note: spec.note });
             lastVal = val;
