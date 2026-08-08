@@ -43,6 +43,12 @@ import { execFile } from "node:child_process";
 import { sendMail, verifySmtp } from "./mailer";
 import { writeFileAtomic } from "../lib/fsAtomic";
 import { rpcPostRaw, rpcPostJson, proxyEndpoint } from "../lib/polymarket/rpcTransport";
+import {
+  classifyRpcRouteState,
+  summarizeRpcQuorum,
+  type RpcQuorum,
+  type RpcRouteState,
+} from "../lib/polymarket/rpcQuorum";
 
 const ROOT = path.resolve(__dirname, "..");
 const DATA = path.join(ROOT, "data");
@@ -314,15 +320,8 @@ async function probeGamma(): Promise<boolean> {
   }
 }
 
-interface RpcQuorum {
-  /** 至少有一条路(代理或直连)能通的端点数。这才是 chain-watch 的真实冗余度。 */
-  alive: number;
-  total: number;
-  /** 两条路都不通的端点。 */
-  dead: string[];
-  /** 分路可用数 —— 用来区分"Clash 死了"和"国际出口烂了"。 */
-  viaProxy: number;
-  viaDirect: number;
+/** 探针自身只多带一个"代理配没配"的标志,判据全部在 lib/polymarket/rpcQuorum.ts。 */
+interface RpcQuorumProbe extends RpcQuorum {
   proxyConfigured: boolean;
 }
 
@@ -338,49 +337,52 @@ interface RpcQuorum {
  * 否则会重演 08-06 的假警(探针并发直连报 0/4 全死,同一 tick 里串行的
  * pUSD 余额却读得到 835.26,chain-watch 也一路 ok)。两条路分别标定还顺带
  * 把"哪一层烂了"直接写进日报:此前这是要人肉 ssh 上去跑对照实验才知道的。 */
-async function probeRpcQuorum(): Promise<RpcQuorum> {
+async function probeRpcQuorum(): Promise<RpcQuorumProbe> {
   const urls = (process.env.ONCHAIN_RPC_URLS?.trim() || "")
     .split(",")
     .map((u) => u.trim())
     .filter(Boolean);
   const proxyConfigured = proxyEndpoint() != null;
   if (urls.length === 0) {
-    return { alive: 0, total: 0, dead: [], viaProxy: 0, viaDirect: 0, proxyConfigured };
+    return {
+      alive: 0,
+      total: 0,
+      dead: [],
+      throttled: [],
+      viaProxy: 0,
+      viaDirect: 0,
+      usableProxy: 0,
+      usableDirect: 0,
+      proxyConfigured,
+    };
   }
   const payload = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_blockNumber", params: [] });
 
-  const probeOne = async (u: string, route: "proxy" | "direct"): Promise<boolean> => {
+  const probeOne = async (u: string, route: "proxy" | "direct"): Promise<RpcRouteState> => {
     try {
       const res = await rpcPostRaw(u, payload, { only: route, timeoutMs: 10_000 });
-      if (res.status < 200 || res.status >= 300) return false;
-      const j = JSON.parse(res.body) as { result?: string; error?: unknown };
-      // 200 包着 error 也是死(1rpc 配额耗尽就是这个形态)。
-      return j?.error == null && typeof j?.result === "string";
+      return classifyRpcRouteState(res.status, res.body);
     } catch {
-      return false;
+      // 超时 / 连接被拒:一个应答都没拿到,链路层面判不可达。
+      return "unreachable";
     }
   };
 
   const results = await Promise.all(
     urls.map(async (u) => {
-      // 两条路并发探,互不阻塞 —— 单端点耗时仍是一条路的量级。
-      const [proxyOk, directOk] = await Promise.all([
-        proxyConfigured ? probeOne(u, "proxy") : Promise.resolve(false),
-        probeOne(u, "direct"),
-      ]);
-      return { host: hostOf(u), proxyOk, directOk };
+      // 2026-08-07 晚:两条路**串行**,不再对同一主机同时双发。原并发写法把最容易
+      // 限流的端点的瞬时压力直接翻倍,是 `死:1rpc.io` 假警的自产来源(实测:背景
+      // 0 并发 → 代理 4.00/4;8 并发 → 3.80/4 且失败恰为 `1rpc.io: HTTP 429`)。
+      // URL 之间仍并行,所以墙钟只从"一条路"变成"两条路",10 分钟一针完全够用。
+      // 注意**两条路照测**:代理成功就跳过直连会毁掉双路标定,而分辨
+      // "Clash 死了"和"国际出口烂了"正是这个探针存在的理由。
+      const proxy: RpcRouteState = proxyConfigured ? await probeOne(u, "proxy") : "unreachable";
+      const direct: RpcRouteState = await probeOne(u, "direct");
+      return { host: hostOf(u), proxy, direct };
     })
   );
 
-  const dead = results.filter((r) => !r.proxyOk && !r.directOk).map((r) => r.host);
-  return {
-    alive: results.filter((r) => r.proxyOk || r.directOk).length,
-    total: urls.length,
-    dead,
-    viaProxy: results.filter((r) => r.proxyOk).length,
-    viaDirect: results.filter((r) => r.directOk).length,
-    proxyConfigured,
-  };
+  return { ...summarizeRpcQuorum(results), proxyConfigured };
 }
 
 /** 只取主机名 —— RPC URL 的 path 常含 API key,绝不进日志/邮件。 */
@@ -586,29 +588,50 @@ async function watch(): Promise<void> {
   // 探针 4:RPC 法定人数(2026-08-02;2026-08-07 起按代理/直连双路标定)。
   // 信号入口的冗余度必须可见。
   {
-    const { alive, total, dead, viaProxy, viaDirect, proxyConfigured } = await probeRpcQuorum();
+    const {
+      alive,
+      total,
+      dead,
+      throttled,
+      viaProxy,
+      viaDirect,
+      usableProxy,
+      usableDirect,
+      proxyConfigured,
+    } = await probeRpcQuorum();
     if (total > 0) {
+      // 判据是**链路可达**数,不是可用读数:被限流的末位兜底腿(1rpc.io 在 .env
+      // 里排第 4,而三个业务消费点全是 for 循环按序降级、第一个成功即返回 ——
+      // 前三路健康时它根本不会被调用)不该把告警拖成 degraded。真正要报的是
+      // 链路层面的失明。2026-08-07 晚实测:该噪音占 `死:1rpc.io` 的全部来源。
       const ok = alive >= 2;
       const fails = ok ? 0 : (state.probeFails[RPC_KEY] ?? 0) + 1;
       state.probeFails[RPC_KEY] = fails;
       const down = fails >= PROBE_FAIL_THRESHOLD || (!ok && state.alert[RPC_KEY]?.status === "down");
       // 分路读数直接进告警正文 —— "代理 0/4 直连 4/4" 一眼看出是 Clash 死了,
       // "代理 4/4 直连 0/4" 则是国际出口烂了(08-06 的常态,当时无法从日报区分)。
+      // 可达数与可用数不等时两个都写,否则"4/4 却取不到数"会变成看不见的坑。
+      const leg = (label: string, reach: number, usable: number) =>
+        `${label} ${reach}/${total}${usable < reach ? `(可用 ${usable})` : ""}`;
       const routes = proxyConfigured
-        ? `代理 ${viaProxy}/${total} · 直连 ${viaDirect}/${total}`
-        : `直连 ${viaDirect}/${total}(未配代理)`;
+        ? `${leg("代理", viaProxy, usableProxy)} · ${leg("直连", viaDirect, usableDirect)}`
+        : `${leg("直连", viaDirect, usableDirect)}(未配代理)`;
+      // 限流与死分开挂 —— 前者是对端的配额闸(链路是通的),后者才是失明。
+      const tail =
+        (dead.length > 0 ? `,死:${dead.join("/")}` : "") +
+        (throttled.length > 0 ? `,限流:${throttled.join("/")}` : "");
       pushProbeEvent(
         RPC_KEY,
         down,
-        `可用 RPC 仅剩 ${alive}/${total} 路(${routes};两路皆死:${dead.join(", ") || "—"})。eth_getLogs 是全系统唯一的信号入口,冗余耗尽即链上告警完全失明。请更换端点或接入付费 RPC。`,
-        "RPC 冗余度已恢复(≥2 路可用)。",
-        `${alive}/${total} 路可用(${routes})${dead.length > 0 ? `,死:${dead.join("/")}` : ""}`
+        `可达 RPC 仅剩 ${alive}/${total} 路(${routes};两路皆不可达:${dead.join(", ") || "—"})。eth_getLogs 是全系统唯一的信号入口,冗余耗尽即链上告警完全失明。请更换端点或接入付费 RPC。`,
+        "RPC 冗余度已恢复(≥2 路可达)。",
+        `${alive}/${total} 路可达(${routes})${tail}`
       );
       summary[RPC_KEY] = down
         ? `down(${alive}/${total};${routes})`
         : dead.length > 0
-          ? `degraded(${alive}/${total};${routes};死:${dead.join("/")})`
-          : `ok(${alive}/${total};${routes})`;
+          ? `degraded(${alive}/${total};${routes}${tail})`
+          : `ok(${alive}/${total};${routes}${tail})`;
     } else {
       // ONCHAIN_RPC_URLS 没配 = 这一针根本没探过。2026-08-02 复查:此前这里既不写
       // alert 也不写 summary,日报只看 alert 就渲染成绿色 ok —— 而"一条 RPC 都没配"
