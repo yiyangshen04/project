@@ -15,7 +15,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bracketFor } from "../scripts/release-sniper";
+import { bracketFor, fireGate, execCapPins } from "../scripts/release-sniper";
 
 test("整数值落进正确档位", () => {
   assert.equal(bracketFor(0)?.short, "≤7");
@@ -56,4 +56,47 @@ test("每个值恰好命中一档 —— 谓词表不许有缝或重叠", () => 
     const v = h / 10; // 0.0 .. 30.0,覆盖所有一位小数
     assert.ok(bracketFor(v) != null, `值 ${v} 没有映射出唯一档位`);
   }
+});
+
+test("fireGate:②∧③ 即开火,pdfLive 不再是前置条件(2026-08-07 行为变更)", () => {
+  // 这一刀就是 08-06 定调("风险预算从确认强度搬到仓位")的落码:稳定期满、
+  // PDF 未上线 → 照样开火,只是要带起 ① 的事后纠错 watcher。08-05 实测首页
+  // 领先 PDF 37s、0x2fdb 在页面更新 15s 后不等 PDF 扫光 0.727 —— 谁把
+  // pdfLive 改回开火前置,这里会响。
+  assert.deepEqual(fireGate({ stableMs: 2000, stableThresholdMs: 2000, pdfLive: false }), {
+    fire: true,
+    watchPdf: true,
+  });
+  assert.deepEqual(fireGate({ stableMs: 2000, stableThresholdMs: 2000, pdfLive: true }), {
+    fire: true,
+    watchPdf: false,
+  });
+  // ③ 未满仍不开火 —— 放宽的是 ①,不是稳定期;不开火也不起 watcher。
+  assert.deepEqual(fireGate({ stableMs: 1999, stableThresholdMs: 2000, pdfLive: false }), {
+    fire: false,
+    watchPdf: false,
+  });
+});
+
+test("execCapPins:同事件帽跟 per-token 一起钉到 USD*4(2026-08-07 核验 §1.4)", () => {
+  // 不钉 per-event 时默认 2×EXEC_MAX_ORDER_USD 在 executeSignal 的 min() 里
+  // 先咬住,声明的 USD*4 补仓容量实际只有一半(08-05 CSU $165 成交离 $200
+  // 帽只差 $35)。三档互斥只买一条腿,事件帽在本脚本语义下 ≡ token 帽。
+  const pins = execCapPins(100, { EXEC_MAX_ORDER_USD: "100" });
+  assert.equal(pins.maxOrder, "100");
+  assert.equal(pins.perToken, "400");
+  assert.equal(pins.perEvent, "400");
+  // 只提供默认,不覆盖显式运维配置。
+  assert.equal(
+    execCapPins(100, { EXEC_MAX_ORDER_USD: "100", EXEC_PER_EVENT_MAX_USD: "150" }).perEvent,
+    "150"
+  );
+  assert.equal(
+    execCapPins(100, { EXEC_MAX_ORDER_USD: "100", EXEC_PER_TOKEN_MAX_USD: "250" }).perToken,
+    "250"
+  );
+  // 单笔仍只收紧不放宽:--usd 大于 env 上限时以 env 为准;env 缺失时兜底 50。
+  assert.equal(execCapPins(200, { EXEC_MAX_ORDER_USD: "100" }).maxOrder, "100");
+  assert.equal(execCapPins(30, {}).maxOrder, "30");
+  assert.equal(execCapPins(80, {}).maxOrder, "50");
 });

@@ -10,34 +10,41 @@
  * (总成交 $7/$0/$2,020,价差 62 个点),所以发布后 ask 侧挂单很可能还在原地
  * —— 那就是我们能吃到的边际。人守到凌晨不现实,交给进程。
  *
- * ── 唯一能亏钱的场景,以及针对它的三重确认 ──────────────────────
+ * ── 唯一能亏钱的场景,以及针对它的 ②∧③ 确认 ────────────────────
  * 数据出来后买对腿,市场风险为零。真正的 −100% 只有一条路径:
  * **页面还没更新时读到旧数字,照着旧数字下单**。
  * (今天早上那条 Macron 市场是另一条:UMA 提案错了。这条我们防不了,只能
  *  靠仓位小 —— 两周内已实证两次,见 08-03 Putin 揭盲。)
  *
- * 所以下单前必须**同时**满足:
- *   ① PDF 已上线      —— Forecast/2026-08.pdf 返回 200(报告确实发了)
+ * 开火判据(2026-08-07 改,落码 08-06 定调"风险预算从确认强度搬到仓位"):
  *   ② 首页已刷新      —— forecasting.html 的 Last-Modified 相对启动时已变
- *   ③ 数字双读一致    —— 间隔 ≥5s 的两次解析拿到同一个值
- * 三条缺一不下单,只发邮件转人工。宁可漏一笔几十美元,不可买反一笔。
+ *   ③ 数字双读一致    —— 同一解析值持续 ≥ --stable 秒
+ * **②∧③ 即以正常金额开火**;两条缺一不下单,只发邮件转人工。
+ *   ① PDF 已上线      —— 从开火前置降级为**事后纠错信号**:开火后若 PDF
+ *      超过 PDF_POST_FIRE_ALERT_MS 仍不 200,发告警转人工 —— 首单拦不住
+ *      (仅 --usd),人工 touch data/trading-halt 能拦住剩余补仓(每轮
+ *      executeSignal 都查 halt 文件)。
+ *
+ * ① 为什么降级(08-05 CSU 实测 + 08-07 核验修订 §7.1):
+ *   · "PDF 必然早于首页"这条时序假设被实测证伪 —— 首页领先 PDF **37 秒**,
+ *     ①∧② 的现实含义是"永远等最慢的那条腿";竞争者 0x2fdb 在页面更新
+ *     15s 后扫光 0.727,根本没等 PDF。核验实测:去掉 ① 后确认时点
+ *     t≈+7.5-8s(原 +13s),单次反事实代价 $33。
+ *   · ① 防的洞("页面因无关原因刷新、LM 变了但 headline 还是旧值")仍然
+ *     存在,残余风险按 08-06 定调交给仓位承担(--usd 量级),不再交给闸门。
+ *   (08-05 曾讨论 ①② 二选一并否掉 —— 那是 OR 语义,两个洞同时敞开;
+ *    本次不是二选一,是 ① 整个移出开火路径、转事后核对,论证不同,别回抄。)
  *
  * 注意 ② 为什么不能省:CSU 完全可能**维持 9 不变**,这时"数字变了"永远
  * 等不到,而 ≥9 才是正确答案。用 Last-Modified 判"页面新鲜度"而不是用
  * "数字变化"判,才能把"新报告仍是 9"和"页面没更新"区分开。
  *
- * ①② 也**不能改成二选一**(2026-08-05 讨论过并否掉):它们防的不是同一个
- * 失效模式 —— ② 防"页面还没刷新时读到旧数字",① 防"页面因无关原因刷新
- * (改导航/换 banner/CDN 重生成)、Last-Modified 变了但 headline 表还是旧值"。
- * 两个洞互不重叠,AND 才有意义,OR 等于两个洞同时敞开。而且 PDF 必然早于
- * 首页更新,`①或②` 在现实时序下会退化成"永远走 ①",放行的那一刻正是
- * 首页还挂着旧值的时候 —— 那就是本脚本全篇在防的唯一 −100%。
- *
  * ── 提速:HEAD 轮询(2026-08-05)────────────────────────────────
  * 延迟大头从来不是 ③ 的 5 秒,是轮询间隔。原实现每轮 GET 159KB 全页,只能
  * 10s/4s 一轮,端到端期望 ~13s(最坏 18s)。改成每轮只 HEAD 拿
  * Last-Modified(几百字节),变了才 GET 全页 —— 2s/1s 一轮,端到端 ~6.5s,
- * 比"砍掉③但不提速"还快,而三道确认一条没丢。速度不用拿安全去换。
+ * 比"砍掉③但不提速"还快,当时的三道确认一条没丢(08-07 起 ① 已按
+ * 08-06 定调移出开火路径,见上文;提速结论不受影响)。
  * 启动时会验证 HEAD 与 GET 的 Last-Modified 是否一致,不一致就自动退回
  * 每轮 GET(fail-safe:宁可慢,不可因为 HEAD 不可信而漏判或误判)。
  *
@@ -96,7 +103,7 @@
  * (补仓量由 perTokenMaxUsd − 已有敞口封死,不会放大总风险)。
  *
  * ── 用法 ────────────────────────────────────────────────────────
- *   # 干跑(默认,不下单;先用它确认映射与三重确认逻辑)
+ *   # 干跑(默认,不下单;先用它确认映射与 ②∧③ 开火逻辑)
  *   ./run-cron.sh scripts/release-sniper.ts --event 773492 --usd 30
  *
  *   # 实弹:必须显式 --arm
@@ -164,6 +171,48 @@ const HEAD_FAST = !argv.includes("--no-head-fast");
 const LLM_FALLBACK = !argv.includes("--no-llm");
 const MAX_RUN_MS = num("--max-hours", 11) * 3600_000;
 const MAIL = !argv.includes("--no-mail");
+
+/** ① 的事后纠错窗口:开火时 PDF 未上线,超过这么久仍不 200 → 告警转人工。
+ * 08-05 实测正常时差 = 首页领先 PDF 37s,3 分钟 ≈ 5 倍余量;超过即形态可疑
+ * (首页可能是无关刷新),人工 touch trading-halt 拦剩余补仓。 */
+const PDF_POST_FIRE_ALERT_MS = 3 * 60_000;
+
+/** ②∧③ 开火判据(导出供离线测试锁行为)。2026-08-07:pdfLive 从开火前置
+ * 条件中移除(08-06 定调落码,①降级为事后纠错)—— 这正是"行为从 ①∧②∧③
+ * 变成 ②∧③"的那一刀,tests/releaseSniper.test.ts 按它断言;谁改回
+ * pdfLive 前置,测试会在这里响。② 由调用方保证(本函数只在 freshPage
+ * 分支内被调用),③ 是 stableMs 门槛。 */
+export function fireGate(input: { stableMs: number; stableThresholdMs: number; pdfLive: boolean }): {
+  fire: boolean;
+  /** 开火但 ① 还没兑现 —— fireAndRefill 要带起事后纠错 watcher。 */
+  watchPdf: boolean;
+} {
+  const fire = input.stableMs >= input.stableThresholdMs;
+  return { fire, watchPdf: fire && !input.pdfLive };
+}
+
+/** 额度 env 钉法(导出供离线测试;main 里原样应用)。只提供默认、不覆盖
+ * 显式配置;单笔只收紧不放宽(min(--usd, env))。
+ * per-event 为什么必须一起钉(2026-08-07 核验 §1.4 暴露):
+ * EXEC_PER_EVENT_MAX_USD 默认 = 2×EXEC_MAX_ORDER_USD,在 executeSignal 的
+ * min() 里先于 per-token 咬住 —— 只钉 per-token 时,USD*4 的补仓容量实际
+ * 永远只有 USD*2(08-05 CSU $165 成交离 $200 帽只差 $35)。事件帽防的是
+ * "一条澄清打 N 个兄弟腿 = 同一判断放大 N 倍"(chain-watch 语义),对本
+ * 脚本不成立:三档互斥、只买命中的那一条腿,事件帽在此退化为一道更严的
+ * token 帽,与 per-token 对齐即可。 */
+export function execCapPins(
+  usd: number,
+  // Record 而非具名字段接口:process.env 是索引签名类型,与"无公共具名属性"
+  // 的字面量接口不兼容(TS2559);测试里的对象字面量两种写法都可赋值。
+  env: Record<string, string | undefined>
+): { maxOrder: string; perToken: string; perEvent: string } {
+  const envMax = Number(env.EXEC_MAX_ORDER_USD ?? "50");
+  return {
+    maxOrder: String(Math.min(usd, Number.isFinite(envMax) ? envMax : usd)),
+    perToken: env.EXEC_PER_TOKEN_MAX_USD ?? String(usd * 4),
+    perEvent: env.EXEC_PER_EVENT_MAX_USD ?? String(usd * 4),
+  };
+}
 
 /** LLM 读数的最小间隔 —— 纯限流,**不再兼任双读的间隔**(见下)。
  * 防的是"页面已刷新但排版怪到四层正则和 LLM 都读不出"时,每轮都烧 Opus,
@@ -330,7 +379,7 @@ async function bestAskOf(tokenId: string): Promise<number | null> {
   return asks[0] ?? null;
 }
 
-// ── 发布三重确认 ──
+// ── 发布确认(②页面新鲜度 ∧ ③双读稳定;① PDF 为事后纠错)──
 
 function stripHtml(h: string): string {
   return h
@@ -521,7 +570,30 @@ async function fireOnce(leg: Leg, value: number, tag: string): Promise<TradeAtte
   return attempt;
 }
 
-async function fireAndRefill(leg: Leg, value: number): Promise<void> {
+async function fireAndRefill(leg: Leg, value: number, pdfLiveAtFire: boolean): Promise<void> {
+  // ① 的事后纠错 watcher(2026-08-07,与开火解耦):②∧③ 开火不再等 PDF,
+  // 但"开火后 PDF 长时间不上线"正是 ① 原本要防的可疑形态(首页无关刷新),
+  // 必须叫人 —— 首单已出(仅 --usd 量级,08-06 定调交给仓位),人工 touch
+  // trading-halt 能拦住的是剩余补仓(fireOnce 每轮都走 executeSignal 的 halt 闸)。
+  // 与补仓循环并发跑,不占用复访节奏;函数末尾统一 await,不让告警死在进程退出后。
+  const pdfWatch = pdfLiveAtFire
+    ? null
+    : (async () => {
+        const deadline = Date.now() + PDF_POST_FIRE_ALERT_MS;
+        while (Date.now() < deadline) {
+          if ((await headStatus(PDF_URL)) === 200) {
+            emit({ kind: "pdf-live", url: PDF_URL, postFire: true });
+            return;
+          }
+          await sleep(5_000);
+        }
+        emit({ kind: "pdf-missing-post-fire", waitedMs: PDF_POST_FIRE_ALERT_MS });
+        await notify(
+          "⚠️ 已按 ②∧③ 开火,但 PDF 迟迟未上线 —— 请人工核对",
+          `<p>开火 ${Math.round(PDF_POST_FIRE_ALERT_MS / 60_000)} 分钟后 <a href="${PDF_URL}">${PDF_URL}</a> 仍非 200(正常时差:首页领先 PDF ~37s,08-05 实测)。</p>` +
+            `<p>若怀疑首页是无关刷新、读到的是旧数字,立刻 <code>touch ~/prededge/data/trading-halt</code> —— 首单拦不住,剩余补仓会被拦住。</p>`
+        );
+      })();
   const first = await fireOnce(leg, value, "");
   await notify(
     `${first?.status === "filled" || first?.status === "partial" ? "✅" : "⚠"} CSU=${value} → ${leg.short} 首单 ${first?.status ?? "未发起"}`,
@@ -546,6 +618,7 @@ async function fireAndRefill(leg: Leg, value: number): Promise<void> {
     `<p>首单 + ${REFILL_TRIES} 次补仓复访结束。</p><p>累计成交:<b>$${Math.round(filledTotal * 100) / 100}</b></p>` +
       `<p>明细见 ${OUT}</p>`
   );
+  if (pdfWatch) await pdfWatch;
 }
 
 // ── 主循环 ──
@@ -572,10 +645,13 @@ async function main(): Promise<void> {
     emit({ kind: "safety", msg: "未给 --arm,已强制 EXEC_MODE=dry(不会真下单)" });
   }
   // 单笔额度按参数收紧(executeSignal 读 env)。只收紧不放宽:取两者较小值,
-  // 防止命令行参数意外把生产上限调大。
-  const envMax = Number(process.env.EXEC_MAX_ORDER_USD ?? "50");
-  process.env.EXEC_MAX_ORDER_USD = String(Math.min(USD, Number.isFinite(envMax) ? envMax : USD));
-  process.env.EXEC_PER_TOKEN_MAX_USD = process.env.EXEC_PER_TOKEN_MAX_USD ?? String(USD * 4);
+  // 防止命令行参数意外把生产上限调大。per-token 与 per-event 一起钉到 USD*4
+  // (补仓容量;缺 per-event 时默认 2×单笔会先咬住,声明的 4× 永远达不到),
+  // 判据与逐条理由见 execCapPins。
+  const pins = execCapPins(USD, process.env);
+  process.env.EXEC_MAX_ORDER_USD = pins.maxOrder;
+  process.env.EXEC_PER_TOKEN_MAX_USD = pins.perToken;
+  process.env.EXEC_PER_EVENT_MAX_USD = pins.perEvent;
 
   const legs = await buildLegs();
   if (!legs) {
@@ -595,7 +671,9 @@ async function main(): Promise<void> {
       emit({ kind: "fatal", msg: `simulate ${SIMULATE} 映射不出唯一档位` });
       process.exit(1);
     }
-    await fireAndRefill(legs.get(b.short)!, SIMULATE);
+    // 自检路径不启动 ① watcher(pdfLiveAtFire=true):--simulate 本就跳过等待,
+    // 事后纠错告警在自检里只是噪音。
+    await fireAndRefill(legs.get(b.short)!, SIMULATE, true);
     return;
   }
 
@@ -610,7 +688,7 @@ async function main(): Promise<void> {
   const headFast = HEAD_FAST && headProbe != null && baselineLastModified != null && headProbe === baselineLastModified;
 
   // baseline 的 Last-Modified 缺失是个静默的大洞:freshPage 的表达式里
-  // `baselineLastModified == null` 会让 ② 恒真,三重确认当场退化成两重,而
+  // `baselineLastModified == null` 会让 ② 恒真,②∧③ 当场退化成只剩 ③,而
   // 日志上完全看不出来。今晚实测拿得到,但拿不到时必须当场说破。
   if (baselineLastModified == null) {
     emit({ kind: "warn", msg: "基线 Last-Modified 缺失 —— ② 页面新鲜度闸恒真,已退化为两重确认" });
@@ -628,7 +706,7 @@ async function main(): Promise<void> {
     "🔫 release-sniper 已上岗",
     `<p>模式:<b>${ARMED ? "实弹" : "DRY"}</b> · 单笔 $${USD} · 追高闸 ${MAX_PRICE}(最坏成交价 ${EXEC_PRICE_CAP.toFixed(3)})</p>` +
       `<p>基线:Last-Modified=${baselineLastModified} · 当前数字=${baselineValue}</p>` +
-      `<p>三重确认(PDF 200 ∧ 首页已刷新 ∧ 数字双读一致)全部满足才下单。</p>` +
+      `<p>开火判据:②首页已刷新 ∧ ③数字双读稳定 即下单;①PDF 200 为事后纠错信号(超 ${Math.round(PDF_POST_FIRE_ALERT_MS / 60_000)}min 不上线即告警)。</p>` +
       `<p>轮询:${headFast ? `HEAD 快路(${POLL_COLD_MS / 1000}s / 热 ${POLL_HOT_MS / 1000}s)` : "每轮 GET 全页(HEAD 不可信,已退回)"}` +
       ` · 正则失败降级 LLM:${LLM_FALLBACK ? "开" : "关"}</p>`
   );
@@ -684,7 +762,8 @@ async function main(): Promise<void> {
             // 冗余仍在;且梯队每层都锚定 14.4,要读出"格式正确但数值错误"
             // 的结果,页面得恰好凑出 `Named Storms <错数> 14.4` —— 半成品
             // 页面几乎不可能,更可能的结果是不匹配(null,不下单)。
-            if (stableMs >= STABLE_MS && pdfLive) {
+            const gate = fireGate({ stableMs, stableThresholdMs: STABLE_MS, pdfLive });
+            if (gate.fire) {
               const b = bracketFor(val);
               emit({
                 kind: "confirmed",
@@ -692,6 +771,7 @@ async function main(): Promise<void> {
                 tier: reading!.tier,
                 raw: reading!.raw,
                 stableMs,
+                pdfLive,
                 bracket: b?.short ?? null,
                 lastModified: cur.lastModified,
               });
@@ -710,7 +790,7 @@ async function main(): Promise<void> {
                     `<p>若这一读是错的,立刻 <code>touch ~/prededge/data/trading-halt</code> —— 首单拦不住(仅 $${USD}),补仓会被拦住。</p>`
                 );
               }
-              await fireAndRefill(legs.get(b.short)!, val);
+              await fireAndRefill(legs.get(b.short)!, val, pdfLive);
               done = true;
               break;
             }
@@ -722,10 +802,13 @@ async function main(): Promise<void> {
         } else if (val != null && !freshPage && pdfLive) {
           // PDF 发了但首页还挂着旧内容 —— 这正是最危险的窗口,绝不下单。
           emit({ kind: "stale-page", value: val, lastModified: cur.lastModified });
-        } else if (val == null && freshPage && pdfLive) {
-          // 报告发了、页面也刷新了,但**四层正则全部读不出来** —— 排版变得
-          // 超出预案。这一支原本是完全静默的:既不落行也不发信,人要等 11
-          // 小时后那封超时邮件才知道错过了整个窗口。两条兜底按顺序上。
+        } else if (val == null && freshPage) {
+          // 页面刷新了,但**四层正则全部读不出来** —— 排版变得超出预案。
+          // 这一支原本是完全静默的:既不落行也不发信,人要等 11 小时后那封
+          // 超时邮件才知道错过了整个窗口。两条兜底按顺序上。
+          // (2026-08-07:与开火判据同批去掉 pdfLive 前置 —— ② 已真、数字
+          //  读不出时,LLM 降级读数没有理由等 PDF;LLM_GAP_MS 限流不变,
+          //  读出后照走 fireGate 同一套 ②∧③ 语义与全部下单风控。)
           emit({ kind: "parse-miss", tiersTried: 4, lastModified: cur.lastModified, sample: cur.text.slice(0, 300) });
 
           if (LLM_FALLBACK && Date.now() - lastLlmAt >= LLM_GAP_MS) {
@@ -782,7 +865,7 @@ async function main(): Promise<void> {
                   `<p>理由:${r1!.reasoning}</p>` +
                   `<p>若这一读是错的,立刻 <code>touch ~/prededge/data/trading-halt</code> —— 首单拦不住(仅 $${USD}),补仓会被拦住。</p>`
               );
-              await fireAndRefill(legs.get(b.short)!, r1!.value);
+              await fireAndRefill(legs.get(b.short)!, r1!.value, pdfLive);
               done = true;
               break;
             }
@@ -800,7 +883,7 @@ async function main(): Promise<void> {
             parseFailAlerted = true;
             await notify(
               "⚠️ 报告已发但数字读不出来 —— 请人工介入",
-              `<p>PDF 已 200、首页已刷新,但四层正则读不出 Named Storms ${llmNote}。</p>` +
+              `<p>首页已刷新${pdfLive ? "(PDF 已 200)" : "(PDF 尚未上线)"},但四层正则读不出 Named Storms ${llmNote}。</p>` +
                 `<p>页面:<a href="${HTML_URL}">${HTML_URL}</a></p>` +
                 `<p>人工读数后可用自检路径直接下单:</p>` +
                 `<pre>ssh sufe 'cd ~/prededge &amp;&amp; ./run-cron.sh scripts/release-sniper.ts --event ${EVENT_ID} --usd ${USD} --max-price ${MAX_PRICE} --arm --simulate &lt;数字&gt;'</pre>` +
@@ -816,7 +899,7 @@ async function main(): Promise<void> {
 
   if (!done) {
     emit({ kind: "timeout", ranMs: Date.now() - startedAt });
-    await notify("⏱ release-sniper 到时退出", "<p>未等到三重确认全部满足,未下任何单。</p>");
+    await notify("⏱ release-sniper 到时退出", "<p>未等到 ②∧③ 同时满足,未下任何单。</p>");
   }
   emit({ kind: "end", ranMs: Date.now() - startedAt });
 }
