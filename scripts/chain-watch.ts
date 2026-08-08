@@ -225,7 +225,11 @@ const REFILL_MAX_PER_TICK = 4;
  *
  * 两条管线仍该有不同的帽:sniper 打的是"官方数字已落地、结果已确定"的秒级
  * 窗口,0.99 档买的是几分钟后的 $1;chain-watch 打的是争议/澄清流,同样的
- * 0.99 是在为几分残值承担 100% 的判错风险 —— 数值可以相同,理由不同。 */
+ * 0.99 是在为几分残值承担 100% 的判错风险 —— 数值可以相同,理由不同。
+ *
+ * 本帽同时透传给 checkExecutability(maxPriceCap,2026-08-07):paper 池的
+ * fillAvail 天花板与实盘同一道帽,否则 (帽, EXEC_MAX_PRICE] 的腿会
+ * "paper 登记、实盘 skip",go/no-go 证据池混入实盘永远不买的腿。 */
 const CHAIN_MAX_ASK = Number(process.env.CHAIN_WATCH_MAX_ASK) || 0.99;
 
 /** 预埋名单上限。bt5 实测 15 个月 80 个市场,批量裁定日一次可预埋数十个姊妹市场。 */
@@ -1563,6 +1567,10 @@ async function main(): Promise<void> {
       // 窄(ask 0.20 处 0.23 vs 0.32),宣告腿被系统性少记 shares/usd 并误打
       // limitCapped —— 偏差方向单一,把 go/no-go 的样本源美化成"入场价优于实盘"。
       declarative: item.declarative === true,
+      // 管线帽同源透传(2026-08-07,0.99 裁决配套):fillAvail 天花板跟实盘
+      // 同一道帽,否则 (CHAIN_MAX_ASK, 0.995] 的腿 paper 登记、实盘 skip,
+      // go/no-go 证据池混入实盘永远不买的腿。
+      maxPriceCap: CHAIN_MAX_ASK,
     });
     execChecked += 1;
   }
@@ -2450,6 +2458,8 @@ async function main(): Promise<void> {
               qid,
               stance: effStance,
               declarative: item.declarative === true,
+              // 管线帽同源透传(与常规注解循环同一道,2026-08-07)。
+              maxPriceCap: CHAIN_MAX_ASK,
             });
           }
           // §13:首轮真实盘口价即锚定,跨轮传递 —— 重试轮重新注解的 bestAsk

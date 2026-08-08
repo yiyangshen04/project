@@ -5,7 +5,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { directionalOutcomeIndex, stancePolarity } from "../lib/polymarket/execCheck";
+import { directionalOutcomeIndex, stancePolarity, effectiveCeilingConfig } from "../lib/polymarket/execCheck";
 
 test("resolve_to_* 以 -no/-yes 结尾的标签不再被 YES/NO 后缀正则劫持", () => {
   // 修复前:/NO$/i.test("resolve_to_bruno")===true → no-side → outcomes 里没有
@@ -53,4 +53,27 @@ test("stancePolarity 整串匹配:resolve_to_* 不再被归为 +/-,保持字面�
   // 「双方判读一致却买反」可达 🟢 闸门
   assert.equal(stancePolarity("resolve_to_hayes"), "resolve_to_hayes");
   assert.equal(stancePolarity("resolve_to_bruno"), "resolve_to_bruno");
+});
+
+test("effectiveCeilingConfig:管线帽只收紧不放宽(2026-08-07,0.99 裁决配套)", () => {
+  // fillAvail 天花板必须与实盘同一道帽:chain-watch 透传 CHAIN_WATCH_MAX_ASK
+  // 后,(帽, EXEC_MAX_PRICE] 的腿不再"paper 登记、实盘 skip"。env 存档/复原,
+  // 不污染同进程其它用例。
+  const saved = process.env.EXEC_MAX_PRICE;
+  delete process.env.EXEC_MAX_PRICE;
+  try {
+    assert.equal(effectiveCeilingConfig(null).maxPrice, 0.995, "未传帽 = 只按 EXEC_MAX_PRICE 默认");
+    assert.equal(effectiveCeilingConfig(undefined).maxPrice, 0.995);
+    assert.equal(effectiveCeilingConfig(0.99).maxPrice, 0.99, "chain-watch 透传后 paper 与实盘同口径");
+    assert.equal(effectiveCeilingConfig(1.5).maxPrice, 0.995, "放宽不允许(与 executeSignal.maxPriceCap 同语义)");
+    assert.equal(effectiveCeilingConfig(0).maxPrice, 0.995, "非法值当没传");
+    assert.equal(effectiveCeilingConfig(NaN).maxPrice, 0.995, "非法值当没传");
+    // 另两个键不受帽影响
+    const cfg = effectiveCeilingConfig(0.99);
+    assert.equal(cfg.slippage, 0.03);
+    assert.equal(cfg.slippageEdgeFrac, 0.15);
+  } finally {
+    if (saved !== undefined) process.env.EXEC_MAX_PRICE = saved;
+    else delete process.env.EXEC_MAX_PRICE;
+  }
 });

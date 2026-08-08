@@ -88,14 +88,31 @@ function envNum(name: string, dflt: number): number {
 }
 
 /** 天花板配置(每次注解现读 env,与实盘同一时刻的 execConfig 取值一致)。
- * 三个键名与默认值逐字抄自 tradeExecutor.execConfig(2026-08-02),不得臆造:
- * EXEC_SLIPPAGE 0.03 / EXEC_SLIPPAGE_EDGE_FRAC 0.15 / EXEC_MAX_PRICE 0.97。 */
+ * 三个键名与默认值逐字抄自 tradeExecutor.execConfig,不得臆造:
+ * EXEC_SLIPPAGE 0.03 / EXEC_SLIPPAGE_EDGE_FRAC 0.15 / EXEC_MAX_PRICE 0.995
+ * (2026-08-06 从 0.97 抬高;本注释此前漏改,2026-08-07 对齐)。 */
 function ceilingConfig(): LimitBandConfig {
   return {
     slippage: envNum("EXEC_SLIPPAGE", 0.03),
     slippageEdgeFrac: envNum("EXEC_SLIPPAGE_EDGE_FRAC", 0.15),
     maxPrice: envNum("EXEC_MAX_PRICE", 0.995),
   };
+}
+
+/** 管线帽注入(2026-08-07,0.99 裁决的配套)。调用方管线有自己的入场价上限
+ * (chain-watch 的 CHAIN_WATCH_MAX_ASK)时,fillAvail 的天花板必须跟着钉:
+ * 否则 (管线帽, EXEC_MAX_PRICE] 区间的腿会按 0.995 天花板走簿并登记进
+ * paper 池,而实盘 executeSignal 在同一价位直接 skip —— paper 记着实盘永远
+ * 不买的腿,go/no-go 的证据池就是脏的(priceBands 抽取的全部理由正是
+ * "paper 与实盘限价逐字同源",分管线帽不能把这个不变量打破)。
+ * 语义与 executeSignal 的 maxPriceCap 逐字同源:只收紧不放宽,非法值
+ * (NaN/≤0)当没传。导出供 tests/execCheck.test.ts 钉死钳位行为。 */
+export function effectiveCeilingConfig(maxPriceCap?: number | null): LimitBandConfig {
+  const cfg = ceilingConfig();
+  if (maxPriceCap != null && Number.isFinite(maxPriceCap) && maxPriceCap > 0 && maxPriceCap < cfg.maxPrice) {
+    cfg.maxPrice = maxPriceCap;
+  }
+  return cfg;
 }
 
 export interface ExecFill {
@@ -424,6 +441,10 @@ export async function checkExecutability(input: {
    * (2026-08-02 复查)。默认 false = 普通档绝对滑点带,向后兼容:未传的调用方
    * 拿到的天花板与第一轮修复逐字一致。 */
   declarative?: boolean;
+  /** 调用方管线的价格帽(chain-watch 透传 CHAIN_WATCH_MAX_ASK)。只收紧
+   * fillAvail 的天花板、不放宽;未传 = 只按 EXEC_MAX_PRICE(与 2026-08-07
+   * 之前行为逐字一致)。见 effectiveCeilingConfig。 */
+  maxPriceCap?: number | null;
 }): Promise<ExecCheck | null> {
   if ((process.env.EXEC_CHECK ?? "").trim().toLowerCase() === "off") return null;
   try {
@@ -488,7 +509,7 @@ export async function checkExecutability(input: {
         // 08-02 复查:天花板改成直接调实盘那支 limitPriceFor —— 第一轮自己写的
         // bestAsk+EXEC_SLIPPAGE 对宣告档窄了最多 0.09(ask 0.20 处 0.23 vs 0.32),
         // 偏差方向是把 paper 池美化成"入场价优于实盘"。
-        const fillCeiling = limitPriceFor(bestAsk, input.declarative === true, ceilingConfig());
+        const fillCeiling = limitPriceFor(bestAsk, input.declarative === true, effectiveCeilingConfig(input.maxPriceCap));
         const avail = walkAsks(asks, MIN_EXEC_USD, fillCeiling);
         if (avail.shares > 0) {
           const availCapped = avail.cost < MIN_EXEC_USD - 0.01;
