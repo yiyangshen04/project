@@ -24,6 +24,8 @@ import {
   priceCapFor,
   parseTiers,
   budgetForAsk,
+  withRetry,
+  transientDecision,
   type UsdmRow,
   type GammaMarket,
 } from "../scripts/oregon-sniper";
@@ -214,7 +216,7 @@ test("日额度 env 缺失时按 execConfig 的同一默认值 150 兜底", () =
 
 // ── fireDecision:优先级顺序 ───────────────────────────────────
 
-const base = { maxPrice: 0.9, usdmAgeMs: 0, usdmStaleMs: 3600_000, marketOpen: true };
+const base = { maxPrice: 0.9, usdmAgeMs: 0, usdmStaleMs: 3600_000, market: "open" as const };
 
 test("正常开火", () => {
   const d = fireDecision({ ...base, ask: 0.68, usdm: "holds" });
@@ -236,7 +238,7 @@ test("revoked 排在最前:即使盘口是空的也必须 halt", () => {
 });
 
 test("revoked 优先于市场已关闭", () => {
-  assert.equal(fireDecision({ ...base, ask: 0.68, usdm: "revoked", marketOpen: false }).halt, true);
+  assert.equal(fireDecision({ ...base, ask: 0.68, usdm: "revoked", market: "closed" }).halt, true);
 });
 
 test("unreadable:停火但绝不 halt", () => {
@@ -258,7 +260,7 @@ test("从未成功读到过(age=Infinity)→ 告警且不开火", () => {
 
 test("市场关闭 / 空盘 / 追高:都只是不开火,不 halt 不告警", () => {
   for (const d of [
-    fireDecision({ ...base, ask: 0.68, usdm: "holds", marketOpen: false }),
+    fireDecision({ ...base, ask: 0.68, usdm: "holds", market: "closed" }),
     fireDecision({ ...base, ask: null, usdm: "holds" }),
     fireDecision({ ...base, ask: 0.97, usdm: "holds" }),
   ]) {
@@ -266,6 +268,116 @@ test("市场关闭 / 空盘 / 追高:都只是不开火,不 halt 不告警", () 
     assert.equal(d.halt, false);
     assert.equal(d.alert, false);
   }
+});
+
+// ── 市场三态:"抓不到" 绝不可当成 "已关闭"(2026-08-09 修的真实缺陷)──
+
+test("市场抓不到 → 停火但**不收工**,这是本次修复的核心", () => {
+  // 修复前:循环里 `marketOpen = m != null && ...` 把抓取失败折叠成 false,
+  // 于是一次几秒的 Gamma 抖动 → 判定"市场已关闭" → 发收工邮件 → return 退出,
+  // 而窗口还开着、仓位还等着补。08-08 18:00 与 08-09 02:10 两次瞬断是实证。
+  const d = fireDecision({ ...base, ask: 0.68, usdm: "holds", market: "unreadable" });
+  assert.equal(d.fire, false, "读不到就不该下单");
+  assert.equal(d.closed, false, "读不到 ≠ 已关闭,绝不可触发收工退出");
+  assert.equal(d.halt, false);
+  assert.equal(d.alert, false, "单轮读不到不告警,连败门槛由 transientDecision 管");
+  assert.match(d.why, /读不到 ≠ 已关闭/);
+});
+
+test("市场**确证**关闭才置 closed=true(收工的唯一入口)", () => {
+  assert.equal(fireDecision({ ...base, ask: 0.68, usdm: "holds", market: "closed" }).closed, true);
+  assert.equal(fireDecision({ ...base, ask: 0.68, usdm: "holds", market: "open" }).closed, false);
+});
+
+test("USDM revoked 优先于市场读不到(halt 不被数据可用性掩盖)", () => {
+  const d = fireDecision({ ...base, ask: null, usdm: "revoked", market: "unreadable" });
+  assert.equal(d.halt, true);
+  assert.equal(d.closed, false);
+});
+
+// ── withRetry:轮内重试 ────────────────────────────────────────
+
+test("withRetry:首次成功就不重试", async () => {
+  let calls = 0;
+  const r = await withRetry(async () => {
+    calls += 1;
+    return { ok: true as const, data: 42 };
+  }, [1, 2], async () => {});
+  assert.equal(calls, 1);
+  assert.equal(r.tries, 1);
+  assert.deepEqual(r.errors, []);
+  assert.deepEqual(r.outcome, { ok: true, data: 42 });
+});
+
+test("withRetry:失败两次后成功 —— 正是两次生产事故的形态", async () => {
+  let calls = 0;
+  const r = await withRetry<number>(async () => {
+    calls += 1;
+    return calls < 3 ? { ok: false, err: `HTTP 502 #${calls}` } : { ok: true, data: 7 };
+  }, [1, 2], async () => {});
+  assert.equal(calls, 3);
+  assert.equal(r.tries, 3);
+  assert.deepEqual(r.errors, ["HTTP 502 #1", "HTTP 502 #2"]);
+  assert.equal(r.outcome.ok && r.outcome.data, 7);
+});
+
+test("withRetry:全失败返回最后一个错误,且尝试次数 = 退避档数 + 1", async () => {
+  let calls = 0;
+  const r = await withRetry<number>(async () => {
+    calls += 1;
+    return { ok: false, err: `TimeoutError #${calls}` };
+  }, [1, 2], async () => {});
+  assert.equal(calls, 3, "3 次尝试 = 首次 + 2 档退避");
+  assert.equal(r.outcome.ok, false);
+  assert.equal(r.outcome.ok === false && r.outcome.err, "TimeoutError #3");
+  assert.equal(r.errors.length, 3, "每次的原因都要留下,不能只留最后一个");
+});
+
+test("withRetry:退避顺序按给定梯度,且最后一次失败后不再多睡一次", async () => {
+  const slept: number[] = [];
+  await withRetry<number>(async () => ({ ok: false, err: "x" }), [1_000, 3_000], async (ms) => {
+    slept.push(ms);
+  });
+  assert.deepEqual(slept, [1_000, 3_000], "3 次尝试之间只有 2 次退避");
+});
+
+// ── transientDecision:连败门槛 ────────────────────────────────
+
+const NOW = "2026-08-09T02:10:00.000Z";
+const LATER = "2026-08-09T02:20:00.000Z";
+
+test("第一轮失败不告警(阈值 3)—— 这正是要消掉的噪音", () => {
+  const t = transientDecision(null, NOW, "HTTP 502", 3);
+  assert.equal(t.next.count, 1);
+  assert.equal(t.alert, false);
+  assert.equal(t.next.firstAtIso, NOW);
+});
+
+test("连续到阈值才告警,且此后每轮仍返回 true(由小时戳 key 收成每小时一封)", () => {
+  const a = transientDecision(null, NOW, "e1", 3);
+  const b = transientDecision(a.next, LATER, "e2", 3);
+  const c = transientDecision(b.next, LATER, "e3", 3);
+  const d = transientDecision(c.next, LATER, "e4", 3);
+  assert.deepEqual([a.alert, b.alert, c.alert, d.alert], [false, false, true, true]);
+  assert.equal(c.next.count, 3);
+  assert.equal(d.next.lastErr, "e4", "邮件里要显示最后一次的原因");
+});
+
+test("firstAtIso 保留首次失败时刻(排查要的是「从什么时候开始坏的」)", () => {
+  const a = transientDecision(null, NOW, "e1", 3);
+  const b = transientDecision(a.next, LATER, "e2", 3);
+  assert.equal(b.next.firstAtIso, NOW);
+});
+
+test("阈值 1 = 恢复旧行为(单轮即告警);阈值 0/负数按 1 处理", () => {
+  assert.equal(transientDecision(null, NOW, "e", 1).alert, true);
+  assert.equal(transientDecision(null, NOW, "e", 0).alert, true, "阈值 0 不可退化成「永不告警」");
+  assert.equal(transientDecision(null, NOW, "e", -5).alert, true);
+});
+
+test("成功后计数被调用方清空 ⟹ 下次失败从 1 重新起算(prev=null 即此语义)", () => {
+  // 不清空的后果:上周那次抖动会和今天这次拼成"连败 2",阈值形同虚设。
+  assert.equal(transientDecision(null, LATER, "e", 3).next.count, 1);
 });
 
 // ── isExhausted:降频判据与 tradeExecutor 的文案对齐 ──────────

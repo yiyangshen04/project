@@ -56,7 +56,9 @@
  * 要吃尾档仍须显式 `--max-price 0.99`,不给默认。
  *
  * 保本准确率对照(= ask + rate×ask×(1−ask),rate=0.05):
- *   0.72 → 0.7301   0.83 → 0.8359   0.90 → 0.9045   0.95 → 0.9524
+ *   0.72 → 0.7301   0.83 → 0.8371   0.90 → 0.9045   0.95 → 0.9524
+ *   (0.83 那格初版误写 0.8359,2026-08-08 由 tests/usdmScan.test.ts 的
+ *    对照断言抓出并订正;不改变任何已做决策 —— 置信度 97–99% 远高于两者。)
  * 我方置信度 = "条款已满足 ∧ 仅剩 R1" ≈ 97–99%,高于 0.9524 但不足以支撑
  * 0.9810。这就是那一刀的位置。
  *
@@ -135,6 +137,11 @@
  *   --poll <秒>           盘口轮询间隔,默认 20
  *   --usdm-ttl <分>       USDM 读数复用时长,默认 15(这么久内不重拉)
  *   --usdm-stale <分>     USDM 连续读不到多久发人工告警并持续停火,默认 60
+ *   --alert-after <轮>    外部源"读不到"连续多少轮才发告警邮件,默认 3
+ *                         (cron 10 分钟一轮 ⟹ 约 30 分钟)。实测单轮失败率
+ *                         1-2% 且下一轮即自愈,单轮就发 = 噪音淹掉真事件。
+ *                         **只对"读不到"这类会自愈的状态生效**;身份/条款不符、
+ *                         触发被撤回这些不会自愈的,永远第一轮就发
  *   --max-hours <小时>    总运行上限,默认 11(run-cron 给 12h 兜底)
  *   --no-mail             不发邮件
  */
@@ -208,6 +215,8 @@ const TIER_ARGS = argv.reduce<string[]>((acc, a, i) => (a === "--tier" && argv[i
 const POLL_MS = num("--poll", 20) * 1000;
 const USDM_TTL_MS = num("--usdm-ttl", 15) * 60_000;
 const USDM_STALE_MS = num("--usdm-stale", 60) * 60_000;
+/** "读不到"连败多少轮才升级为告警邮件。见 transientDecision 的注释。 */
+const ALERT_AFTER = num("--alert-after", 3);
 const MAX_RUN_MS = num("--max-hours", 11) * 3600_000;
 const MAIL = !argv.includes("--no-mail");
 
@@ -323,6 +332,10 @@ export interface UsdmVerdict {
   kind: UsdmKind;
   d4: number | null;
   reason: string;
+  /** 传输层失败的原始细节(HTTP 码 / 错误名),由 readUsdm 填。
+   * usdmVerdict 这个纯函数不填 —— 它看到的已经是 null,分不出"超时"还是
+   * "502"还是"JSON 坏了",而这三者的排查路径完全不同。 */
+  fetchErr?: string | null;
 }
 
 /**
@@ -552,6 +565,19 @@ export function budgetForAsk(ask: number | null, tiers: BudgetTier[], fallback: 
   return { usd: fallback, tier: null };
 }
 
+/**
+ * 市场状态三态 —— 与 USDM 的三态同构,理由也同构。
+ *
+ * `unreadable` 这一态是 2026-08-09 修的一个真实缺陷:此前循环里写的是
+ *   `const marketOpen = m != null && m.closed !== true && ...`
+ * 于是 Gamma 抓取失败(m == null)与"市场真的 closed"合并成同一个 false,
+ * 守盘器会因为**一次几秒的网络抖动**判定"市场已关闭"、发一封收工邮件、
+ * 然后 return 退出 —— 而窗口其实还开着、仓位还等着补。08-08 18:00 与
+ * 08-09 02:10 两次外部源瞬断(各 1 次、下一轮即自愈)正是这条路径的实证。
+ * 读不到 ≠ 已关闭,和"读不到 ≠ 被撤回"是同一条纪律。
+ */
+export type MarketState = "open" | "closed" | "unreadable";
+
 export interface FireInput {
   ask: number | null;
   maxPrice: number;
@@ -559,7 +585,7 @@ export interface FireInput {
   /** 距上次 USDM 成功读数的毫秒数;从未成功过传 Infinity。 */
   usdmAgeMs: number;
   usdmStaleMs: number;
-  marketOpen: boolean;
+  market: MarketState;
 }
 
 export interface FireDecision {
@@ -568,6 +594,8 @@ export interface FireDecision {
   halt: boolean;
   /** 需要发一封人工告警(USDM 长时间读不到)。 */
   alert: boolean;
+  /** 市场**确证**已关闭 ⟹ 收工退出。抓不到市场时恒为 false。 */
+  closed: boolean;
   why: string;
 }
 
@@ -578,11 +606,15 @@ export interface FireDecision {
  *   revoked 必须排在最前 —— 它是唯一需要**停掉整个系统**的状态,任何"盘口没货
  *   所以先 return"的短路都会把这条硬闸旁路掉(闸门被数据可用性掩盖是审计里
  *   反复出现的形态)。
- * 其后才是 unreadable(停火)→ 市场关闭(退出)→ 盘口(空/贵则等下一轮)。
+ * 其后才是 unreadable(停火)→ 市场关闭(退出)→ 市场读不到(停火)→ 盘口。
+ *
+ * 注意最后两条的**顺序与语义差**:closed 是确证的终态 ⟹ 收工;market
+ * unreadable 只是这一轮没读到 ⟹ 与 USDM unreadable 同款处理,停火等下一轮,
+ * 绝不 return。把它们合并回布尔就是 2026-08-09 修掉的那个缺陷。
  */
 export function fireDecision(i: FireInput): FireDecision {
   if (i.usdm === "revoked") {
-    return { fire: false, halt: true, alert: true, why: "USDM 判定:触发已被撤回/下修" };
+    return { fire: false, halt: true, alert: true, closed: false, why: "USDM 判定:触发已被撤回/下修" };
   }
   if (i.usdm === "unreadable") {
     const stale = i.usdmAgeMs > i.usdmStaleMs;
@@ -590,21 +622,97 @@ export function fireDecision(i: FireInput): FireDecision {
       fire: false,
       halt: false,
       alert: stale,
+      closed: false,
       why: stale
         ? `USDM 连续 ${Math.round(i.usdmAgeMs / 60_000)} 分钟读不到(> ${Math.round(i.usdmStaleMs / 60_000)} 分阈值),持续停火并告警`
         : "USDM 本轮读不到,停火等下一轮(未超 stale 阈值)",
     };
   }
-  if (!i.marketOpen) {
-    return { fire: false, halt: false, alert: false, why: "市场已关闭/停止接单(可能已 finalize)" };
+  if (i.market === "closed") {
+    return { fire: false, halt: false, alert: false, closed: true, why: "市场已关闭/停止接单(可能已 finalize)" };
+  }
+  if (i.market === "unreadable") {
+    return { fire: false, halt: false, alert: false, closed: false, why: "本轮取不到市场状态,停火等下一轮(读不到 ≠ 已关闭)" };
   }
   if (i.ask == null) {
-    return { fire: false, halt: false, alert: false, why: "盘口无卖单,taker 不可成交" };
+    return { fire: false, halt: false, alert: false, closed: false, why: "盘口无卖单,taker 不可成交" };
   }
   if (i.ask > i.maxPrice) {
-    return { fire: false, halt: false, alert: false, why: `ask ${i.ask} > 追高闸 ${i.maxPrice},不追高` };
+    return { fire: false, halt: false, alert: false, closed: false, why: `ask ${i.ask} > 追高闸 ${i.maxPrice},不追高` };
   }
-  return { fire: true, halt: false, alert: false, why: `ask ${i.ask} ≤ ${i.maxPrice},触发有效,开火` };
+  return { fire: true, halt: false, alert: false, closed: false, why: `ask ${i.ask} ≤ ${i.maxPrice},触发有效,开火` };
+}
+
+// ── 外部源读不到:轮内重试 + 跨轮连败计数 ──────────────────────
+
+/** 带诊断的抓取结果。失败时**必须**带上可排查的原因 —— 把 HTTP 502、
+ * TimeoutError、JSON 解析失败一律压成 `null` 正是 08-08/08-09 两次事故
+ * 无法当场定性的原因:日志上"取不到市场"与"市场没了"长得一模一样。 */
+export type FetchOutcome<T> = { ok: true; data: T } | { ok: false; err: string };
+
+/** 轮内重试的退避梯度。秒级即可 —— 两次实测故障都是几秒内快速失败、
+ * 下一轮(10 分钟后)自愈,属于对端瞬时拒绝而非持续不可达。 */
+export const RETRY_BACKOFF_MS = [1_000, 3_000];
+
+/**
+ * 失败重试(纯逻辑,sleep 可注入 ⟹ 测试里零延时跑完)。
+ *
+ * 为什么重试要放在**轮内**而不是"等下一轮 cron":守盘器每轮都是一次独立的
+ * 机会评估,一轮丢掉 = 10 分钟盘口无人看管。而实测这两类失败在 1 秒后重试
+ * 就能过 —— 用几秒换一整轮,是这段代码存在的全部理由。
+ */
+export async function withRetry<T>(
+  attempt: (n: number) => Promise<FetchOutcome<T>>,
+  backoffMs: number[] = RETRY_BACKOFF_MS,
+  sleepFn: (ms: number) => Promise<void> = sleep
+): Promise<{ outcome: FetchOutcome<T>; tries: number; errors: string[] }> {
+  const errors: string[] = [];
+  for (let i = 0; i <= backoffMs.length; i += 1) {
+    const outcome = await attempt(i + 1);
+    if (outcome.ok) return { outcome, tries: i + 1, errors };
+    errors.push(outcome.err);
+    if (i < backoffMs.length) await sleepFn(backoffMs[i]!);
+  }
+  return {
+    outcome: { ok: false, err: errors[errors.length - 1] ?? "未知错误" },
+    tries: backoffMs.length + 1,
+    errors,
+  };
+}
+
+/** 一个外部源连续读不到的跨轮状态。cron `--once` 每轮是独立进程,
+ * 内存计数恒为 1 —— 必须落盘才能表达"连续"。 */
+export interface TransientState {
+  count: number;
+  firstAtIso: string | null;
+  lastErr: string | null;
+}
+
+/**
+ * "读不到"该不该升级成告警邮件。
+ *
+ * 门槛存在的理由是实测数据:oregon-sniper 上线以来 52 轮 Gamma 里 1 轮抓不到、
+ * 99 轮 USDM 里 1 轮读不到,**两次都在下一轮自愈**。单轮失败即发红色 🛑 邮件,
+ * 等于用一个 1-2% 概率的自愈事件去消耗收件人的注意力,而真正需要人动手的事
+ * (触发被撤回、条款被改写)会被埋在同样的红色里 —— 被噪音淹掉的告警等于
+ * 没有告警,这条纪律在本文件的 notifyTerminal 注释里已经写过一次。
+ *
+ * ⚠ 只对**会自愈**的状态用它。revoked、身份/条款不符、市场确证关闭都不走
+ * 这条路:它们不会自己好,晚一轮知道就是晚一轮的损失。
+ */
+export function transientDecision(
+  prev: TransientState | null,
+  nowIso: string,
+  err: string,
+  threshold: number
+): { next: TransientState; alert: boolean } {
+  const count = (prev?.count ?? 0) + 1;
+  return {
+    next: { count, firstAtIso: prev?.firstAtIso ?? nowIso, lastErr: err },
+    // 达到阈值后**每轮**都返回 true,由 notifyTerminal 的小时戳 key 收成
+    // "每小时最多一封" —— 持续故障应当持续提醒,只是不必每 10 分钟一封。
+    alert: count >= Math.max(1, threshold),
+  };
 }
 
 /** ledger skip 原因 → 是否"额度/深度已耗尽"(耗尽后降频轮询,不刷屏也不空转)。
@@ -617,13 +725,57 @@ export function isExhausted(reason: string | undefined): boolean {
 
 // ══ IO 区 ═════════════════════════════════════════════════════
 
-async function getJson<T>(url: string, ms = 20_000): Promise<T | null> {
+/** 带诊断的抓取。失败原因逐字保留 —— 见 FetchOutcome 的注释。 */
+async function fetchJson<T>(url: string, ms: number): Promise<FetchOutcome<T>> {
   try {
     const res = await fetch(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(ms) });
-    if (!res.ok) return null;
-    return (await res.json()) as T;
+    if (!res.ok) return { ok: false, err: `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}` };
+    return { ok: true, data: (await res.json()) as T };
+  } catch (err) {
+    // name 与 message 都要:AbortSignal.timeout 抛的是 TimeoutError,而代理
+    // 瞬断抛的是 TypeError: fetch failed —— 两者的排查路径完全不同。
+    return { ok: false, err: err instanceof Error ? `${err.name}: ${err.message}` : String(err) };
+  }
+}
+
+/** 只关心成败、不关心原因的旧调用点(readBook)继续用它。 */
+async function getJson<T>(url: string, ms = 20_000): Promise<T | null> {
+  const r = await fetchJson<T>(url, ms);
+  return r.ok ? r.data : null;
+}
+
+// ── 连败计数的落盘(纯判据在 transientDecision,这里只管读写)────
+
+const transientFile = (key: string): string => path.join(ROOT, "data", `oregon-sniper-transient-${key}.json`);
+
+function readTransient(key: string): TransientState | null {
+  try {
+    const raw = fs.readFileSync(transientFile(key), "utf8");
+    const s = JSON.parse(raw) as Partial<TransientState>;
+    if (typeof s.count !== "number" || !Number.isFinite(s.count)) return null;
+    return { count: s.count, firstAtIso: s.firstAtIso ?? null, lastErr: s.lastErr ?? null };
   } catch {
+    // 文件不存在 / 内容损坏 —— 都当"没有连败史"。读不出计数绝不能反过来
+    // 阻塞主流程,最坏结果只是多发一封信。
     return null;
+  }
+}
+
+function writeTransient(key: string, s: TransientState): void {
+  try {
+    fs.mkdirSync(path.dirname(transientFile(key)), { recursive: true });
+    fs.writeFileSync(transientFile(key), JSON.stringify(s) + "\n");
+  } catch (err) {
+    emit({ kind: "warn", msg: `连败计数写入失败(${key}): ${err instanceof Error ? err.message : String(err)}` });
+  }
+}
+
+/** 读成功了就把连败史抹掉 —— 否则"上周那次抖动"会和今天这次拼成连败。 */
+function clearTransient(key: string): void {
+  try {
+    fs.rmSync(transientFile(key), { force: true });
+  } catch {
+    /* 清不掉最多是多发一封信,不值得打断主流程 */
   }
 }
 
@@ -635,18 +787,48 @@ function usdmUrl(statisticsType: 1 | 2): string {
   );
 }
 
-/** 两个口径**并发**拉:它们互为一致性校验,串行只是白白多花一倍时间。 */
+/** 两个口径**并发**拉(它们互为一致性校验,串行只是白白多花一倍时间);
+ * 每一路各自带轮内重试 —— 08-09 02:10 那次正是两路里 cumulative 单边失败。 */
 async function readUsdm(): Promise<UsdmVerdict> {
   const [cat, cum] = await Promise.all([
-    getJson<UsdmRow[]>(usdmUrl(2), 25_000),
-    getJson<UsdmRow[]>(usdmUrl(1), 25_000),
+    withRetry<UsdmRow[]>(() => fetchJson<UsdmRow[]>(usdmUrl(2), 25_000)),
+    withRetry<UsdmRow[]>(() => fetchJson<UsdmRow[]>(usdmUrl(1), 25_000)),
   ]);
-  return usdmVerdict(cat, cum);
+  const v = usdmVerdict(
+    cat.outcome.ok ? cat.outcome.data : null,
+    cum.outcome.ok ? cum.outcome.data : null
+  );
+  const errs = [
+    cat.outcome.ok ? null : `categorical ${cat.outcome.err}(试 ${cat.tries} 次)`,
+    cum.outcome.ok ? null : `cumulative ${cum.outcome.err}(试 ${cum.tries} 次)`,
+  ].filter((x): x is string => x != null);
+  if (errs.length === 0) return { ...v, fetchErr: null };
+  // 传输层原因附在 reason 后面:usdmVerdict 只能说"cumulative 请求失败",
+  // 而人要看的是"失败成什么样"。
+  return { ...v, reason: `${v.reason} —— ${errs.join(";")}`, fetchErr: errs.join(";") };
 }
 
-async function fetchMarket(): Promise<GammaMarket | null> {
-  const arr = await getJson<GammaMarket[]>(`${GAMMA_API}/markets?slug=${SLUG}`);
-  return arr?.[0] ?? null;
+/** 市场读取的三态结果。`err != null` = **传输层**没读到(与"平台说这条盘
+ * 不存在"分开:后者 err 也非 null,但文案里写明 HTTP 200,排查路径不同)。 */
+interface MarketRead {
+  market: GammaMarket | null;
+  err: string | null;
+  tries: number;
+}
+
+async function fetchMarket(): Promise<MarketRead> {
+  const { outcome, tries, errors } = await withRetry<GammaMarket[]>(() =>
+    fetchJson<GammaMarket[]>(`${GAMMA_API}/markets?slug=${SLUG}`, 20_000)
+  );
+  if (!outcome.ok) {
+    return { market: null, err: `${outcome.err}(试 ${tries} 次:${errors.join(" | ")})`, tries };
+  }
+  const m = outcome.data?.[0] ?? null;
+  if (m == null) {
+    const n = Array.isArray(outcome.data) ? `${outcome.data.length} 条` : "非数组";
+    return { market: null, err: `HTTP 200 但 slug 无匹配市场(返回 ${n})`, tries };
+  }
+  return { market: m, err: null, tries };
 }
 
 interface BookSnapshot {
@@ -828,14 +1010,43 @@ async function main(): Promise<void> {
   });
 
   // ── 启动硬门槛 ①:身份 + 方向 + 条款 ──
-  const market = await fetchMarket();
+  // 两类失败刻意分道:**读不到**(会自愈,连败到阈值才吵)与**读到了但不对**
+  // (不会自愈,第一轮就吵)。合并成一条红色告警正是 08-08/08-09 噪音的来源。
+  const read = await fetchMarket();
+  if (read.err != null) {
+    const t = transientDecision(readTransient("gamma"), new Date().toISOString(), read.err, ALERT_AFTER);
+    writeTransient("gamma", t.next);
+    emit({
+      kind: "fatal",
+      msg: "取不到市场,拒绝启动(读不到 ≠ 市场已关闭)",
+      err: read.err,
+      tries: read.tries,
+      streak: t.next.count,
+      alertAfter: ALERT_AFTER,
+      alerted: t.alert,
+    });
+    if (t.alert) {
+      await notifyTerminal(
+        `gamma-unreadable-${hourKey()}`,
+        `⚠️ oregon-sniper 连续 ${t.next.count} 轮取不到市场(Gamma)`,
+        `<p>未下任何单。<b>这不代表市场被关闭</b> —— 是 Gamma 没读到。</p>` +
+          `<p>最后一次原因:<code>${read.err}</code></p>` +
+          `<p>首次失败:${t.next.firstAtIso} · 连续 ${t.next.count} 轮(阈值 ${ALERT_AFTER})· 每轮已重试 ${read.tries} 次</p>` +
+          `<p>先查代理可达性;市场真被下架会走另一条判据(closed/acceptingOrders),文案不同。</p>`
+      );
+    }
+    process.exit(1);
+  }
+  clearTransient("gamma");
+  const market = read.market;
   const id = identityCheck(market);
   if (!id.ok) {
     emit({ kind: "fatal", msg: "身份/条款校验失败,拒绝启动", problems: id.problems });
     await notifyTerminal(
       `identity-${hourKey()}`,
       "🛑 oregon-sniper 拒绝启动:身份或条款校验失败",
-      `<p>未下任何单。问题:</p><ul>${id.problems.map((p) => `<li>${p}</li>`).join("")}</ul>`
+      `<p>未下任何单。<b>市场读到了,但内容与写死的常量不符</b> —— 这类问题不会自愈。问题:</p>` +
+        `<ul>${id.problems.map((p) => `<li>${p}</li>`).join("")}</ul>`
     );
     process.exit(1);
   }
@@ -848,19 +1059,40 @@ async function main(): Promise<void> {
   let usdmOkAt = usdm.kind === "holds" ? Date.now() : 0;
   // verdict 而非展开 ...usdm:UsdmVerdict 自己带一个 kind 字段,展开会把日志行
   // 的 kind 从 "usdm" 覆盖成 "holds"/"revoked",按 kind 过滤日志时整类行消失。
-  emit({ kind: "usdm", verdict: usdm.kind, d4: usdm.d4, reason: usdm.reason, mapDate: TRIGGER_MAP_DATE_ISO });
-  if (usdm.kind !== "holds") {
-    emit({ kind: "fatal", msg: `USDM 首轮校验未通过(${usdm.kind}),拒绝启动` });
+  emit({ kind: "usdm", verdict: usdm.kind, d4: usdm.d4, reason: usdm.reason, fetchErr: usdm.fetchErr ?? null, mapDate: TRIGGER_MAP_DATE_ISO });
+  if (usdm.kind === "revoked") {
+    // 撤回不会自愈,也不该等 —— 第一轮就发,且 key 不带小时戳(终态,只发一次)。
+    emit({ kind: "fatal", msg: "USDM 首轮校验未通过(revoked),拒绝启动" });
     await notifyTerminal(
-      usdm.kind === "revoked" ? "usdm-revoked" : `usdm-unreadable-${hourKey()}`,
-      `🛑 oregon-sniper 拒绝启动:USDM 首轮 ${usdm.kind}`,
-      `<p>未下任何单。${usdm.reason}</p>` +
-        (usdm.kind === "revoked"
-          ? "<p><b>这是 R1 实现了 —— 触发已被撤回,这条盘不再可做。</b></p>"
-          : "<p>读不到 ≠ 被撤回。先排查代理/API 可达性(注意 aoi 必须是 FIPS 数字码 41,传 OR 会返回空数组 + HTTP 200)。</p>")
+      "usdm-revoked",
+      "🛑 oregon-sniper 拒绝启动:USDM 首轮 revoked",
+      `<p>未下任何单。${usdm.reason}</p><p><b>这是 R1 实现了 —— 触发已被撤回,这条盘不再可做。</b></p>`
     );
     process.exit(1);
   }
+  if (usdm.kind !== "holds") {
+    const t = transientDecision(readTransient("usdm"), new Date().toISOString(), usdm.reason, ALERT_AFTER);
+    writeTransient("usdm", t.next);
+    emit({
+      kind: "fatal",
+      msg: "USDM 首轮校验未通过(unreadable),拒绝启动",
+      streak: t.next.count,
+      alertAfter: ALERT_AFTER,
+      alerted: t.alert,
+    });
+    if (t.alert) {
+      await notifyTerminal(
+        `usdm-unreadable-${hourKey()}`,
+        `⚠️ oregon-sniper 连续 ${t.next.count} 轮读不到 USDM`,
+        `<p>未下任何单。<b>读不到 ≠ 被撤回</b>,kill-switch 未落、仓位未动。</p>` +
+          `<p>最后一次原因:${usdm.reason}</p>` +
+          `<p>首次失败:${t.next.firstAtIso} · 连续 ${t.next.count} 轮(阈值 ${ALERT_AFTER})</p>` +
+          `<p>先排查代理/API 可达性(注意 aoi 必须是 FIPS 数字码 41,传 OR 会返回空数组 + HTTP 200)。</p>`
+      );
+    }
+    process.exit(1);
+  }
+  clearTransient("usdm");
 
   const cfg = execConfig();
   // 上线邮件在 --once(cron 模式)下必须闭嘴:每 10 分钟一封 = 144 封/天,
@@ -915,17 +1147,28 @@ async function main(): Promise<void> {
 
     // 市场状态:已 finalize / 停止接单就没什么可守的了。每轮重拉一次,
     // 这也是"7 天 holding 期到底哪天结束"那个未闭环项(R2)的实际观测点。
-    const m = await fetchMarket();
-    const marketOpen = m != null && m.closed !== true && m.acceptingOrders !== false;
+    // ⚠ 三态而非布尔:抓不到时**不能**当成已关闭,否则一次网络抖动就让守盘器
+    //   发一封"收工"邮件然后退出,而窗口还开着(2026-08-09 修)。
+    const mr = await fetchMarket();
+    const m = mr.market;
+    const marketState: MarketState =
+      mr.err != null ? "unreadable" : m!.closed === true || m!.acceptingOrders === false ? "closed" : "open";
+    if (marketState === "unreadable") {
+      const t = transientDecision(readTransient("gamma"), new Date().toISOString(), mr.err!, ALERT_AFTER);
+      writeTransient("gamma", t.next);
+      emit({ kind: "market-unreadable", round, err: mr.err, tries: mr.tries, streak: t.next.count });
+    } else {
+      clearTransient("gamma");
+    }
 
-    const book = marketOpen ? await readBook() : null;
+    const book = marketState === "open" ? await readBook() : null;
     const decision = fireDecision({
       ask: book?.bestAsk ?? null,
       maxPrice: MAX_PRICE,
       usdm: usdm.kind,
       usdmAgeMs: usdmOkAt === 0 ? Number.POSITIVE_INFINITY : Date.now() - usdmOkAt,
       usdmStaleMs: USDM_STALE_MS,
-      marketOpen,
+      market: marketState,
     });
 
     // ── R1 实现:落 kill-switch,停掉的是**整个系统**,不只是本进程 ──
@@ -955,7 +1198,7 @@ async function main(): Promise<void> {
       await notify("⚠️ oregon-sniper:USDM 长时间读不到,已持续停火", `<p>${decision.why}</p><p>${usdm.reason}</p>`);
     }
 
-    if (!marketOpen) {
+    if (decision.closed) {
       flushIdle();
       emit({ kind: "market-closed", closed: m?.closed, acceptingOrders: m?.acceptingOrders, filledTotal });
       await notifyTerminal(
