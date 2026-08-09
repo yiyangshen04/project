@@ -72,6 +72,12 @@ case "$name" in
   # oregon-sniper 不是蹲发布窗口而是蹲**成交**(答案已知,守着把 ≤ 阈值价的
   # 卖单吃干净),同样是常驻长跑,同样必须大于它自己的 --max-hours 默认 11h。
   release-watch|release-sniper|oregon-sniper) RUN_TIMEOUT=43200 ;;
+  # tornado-watch 单轮正常 ~15s,但 NCEI **会瞬时限流**(2026-08-08 实测:首读 200、
+  # 随后 25s 与 60s 两次全超时、3 分钟后恢复),所以它的重试退避是 2s/15s/45s ——
+  # 跨到分钟量级才有意义。最坏情形:探测两个 ytd 档 × 4 次尝试 ×(30s 超时 + 退避)
+  # 已超过默认 300s,会被 SIGTERM 掉、在日志里只留一行 WARN,症状与"NCEI 挂了"
+  # 完全无法区分。给 900s。
+  tornado-watch) RUN_TIMEOUT=900 ;;
   *)           RUN_TIMEOUT=300 ;;
 esac
 timeout -k 30 "$RUN_TIMEOUT" "$TSX_BIN" "$@"
